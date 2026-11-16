@@ -16,7 +16,12 @@ dssim = "3.4.0"
 gpui = "0.2.2"
 gpui-component = "0.5.1"
 image = "0.25.10"
-imageflow_core = { path = "../imageflow/imageflow_core" }
-imageflow_helpers = { path = "../imageflow/imageflow_helpers" }
-imageflow_types = { path = "../imageflow/imageflow_types" }
+# imageflow 以固定 commit 7cbe26be 的 git submodule 引入（见 .gitmodules）。
+# feature 说明：zen-codecs（纯 Rust，无 C 工具链）依赖 zenjpeg/zenwebp 的 git main 分支，
+# 这两个 API 尚未发布到 crates.io；当网络可访问 GitHub 时，改为下面这行并加对应 patch：
+#   imageflow_core = { path = "vendor/imageflow/imageflow_core", default-features = false, features = ["zen-codecs"] }
+# 当前基线沿用 c-codecs（本机有 NASM），保证可编译；见 .docs/DEV_PLAN.md 风险表。
+imageflow_core = { path = "vendor/imageflow/imageflow_core" }
+imageflow_types = { path = "vendor/imageflow/imageflow_types" }
 anyhow = "1.0.104"
+dirs = "4.0.0"

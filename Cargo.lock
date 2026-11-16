@@ -56,12 +56,12 @@ name = "akashic"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs 4.0.0",
  "dssim",
  "gpui",
  "gpui-component",
  "image",
  "imageflow_core",
- "imageflow_helpers",
  "imageflow_types",
 ]
 

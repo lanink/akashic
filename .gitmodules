@@ -1,0 +1,3 @@
+[submodule "vendor/imageflow"]
+	path = vendor/imageflow
+	url = https://github.com/imazen/imageflow.git

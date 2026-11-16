@@ -1,14 +1,6 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Akashic —— 本地优先的相册整理师。
+//!
+//! 分层：`main.rs → ui → core → 外部设施`。core 不依赖 gpui。
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod core;
+pub mod ui;

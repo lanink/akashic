@@ -98,7 +98,9 @@ tests/
 | GCJ-02 转换 | **暂缓**（原自实现或小 crate） | EXIF 的 WGS84 坐标转为国内地图要求的 GCJ-02 | 本期不实现；未来重启时只做坐标偏移，不用带 OSM 边界 mask 的库做领土判断；个人本地数据仅本地保存 |
 | 腾讯位置服务 GL JS | **暂缓**（原运行时依赖） | 渲染照片足迹地图与标记 | 本期不引入；未来重启时独立桌面应用需自行申请 key，代码中只写占位符，禁止内置可用 key |
 
-明确不做：`c-codecs`（避免 NASM / VS Build Tools）、`imageflow_abi` / `imageflow_tool` / `imageflow_server`（直接调用 Rust API）、OCR、云同步、HEIC/HEIF 解码、Google/Apple/Bing/Mapbox/OSM 瓦片与第三方未资质地图源。
+明确不做：`imageflow_abi` / `imageflow_tool` / `imageflow_server`（直接调用 Rust API）、OCR、云同步、HEIC/HEIF 解码、Google/Apple/Bing/Mapbox/OSM 瓦片与第三方未资质地图源。
+
+> **2026-11-16 M0 实测修正（zen-codecs 并非纯 crates.io）**：原判断“`zen-codecs` 无 C 依赖、可避开 NASM”只对一半。查固定 commit 的 `imageflow/Cargo.toml` 发现，`zen-codecs` 依赖 `zenjpeg`、`zenwebp` 两个 **git main 分支**（`CmykHandling` 等 API 未发布到 crates.io），还带 `libpng-sys` / `lcms2-sys` 的 `[patch.crates-io]`。作为独立项目引用 submodule 时这些 patch 不会继承，会解析到 crates.io 旧版（zenjpeg 0.8.4）导致 `CmykHandling` 编译错误；必须复制 `[patch.crates-io]` 才能用 git 版（0.8.7）。本机网络对 GitHub 报 502，拉不到这两个 git 依赖，故 **M0 基线暂用默认的 `c-codecs`**（本机已验证有 NASM，可编译），并在 Cargo.toml 注释中写好 zen-codecs 切换配置。待网络可访问 GitHub 后再切换并重验。这是环境阻塞，不是方案否定；`zen-codecs` 仍为既定目标。
 
 使用边界：**imageflow 只负责“把图像变成目标像素/文件”，不负责分类决策**；**OxiGeo 只负责地理数据读写与坐标运算，不负责渲染地图、不提供底图瓦片**。模糊、相似、截图、大文件的判断放在 `core/analyze/`，地图展示交给合规地图服务。
 
@@ -186,7 +188,7 @@ OxiGeo 可行性结论：**可以做，但不是照片足迹的核心依赖**。
 | --- | --- | --- |
 | `../imageflow/*` 在仓库外 | 换机器直接构建失败 | M0 改为 git submodule 或 vendored，并固定 commit `7cbe26be` |
 | imageflow Rust API 不稳定 | 升级 imageflow 可能破坏编译 | 只在 `core/imaging.rs` 适配；依赖版本不跟随 C ABI tag |
-| imageflow 默认 `c-codecs` | Windows 需 NASM / VS Build Tools | 显式 `default-features = false, features = ["zen-codecs"]` |
+| imageflow `zen-codecs` 依赖 git 分支 | 需访问 GitHub 拉 zenjpeg/zenwebp main，且需复制 `[patch.crates-io]`；本机 502 | M0 基线暂用 c-codecs（本机有 NASM 可编译）；Cargo.toml 已注释切换配置，网络恢复后切换并重验；长期目标仍是 zen-codecs 免 C 工具链 |
 | imageflow AGPLv3 | 商业分发可能需要授权 | 已确认个人本地使用，暂不处理；若未来分发再评估授权或例外 |
 | 地图源合规 | 使用未资质地图源会有合规风险 | 只用腾讯/高德/百度/天地图；默认腾讯地图；坐标使用 GCJ-02 |
 | 地图 key 泄露或过期 | 足迹地图不可用 | 自行申请 key，代码中只保留占位符，配置 Referer 白名单，禁止内置可用 key |
