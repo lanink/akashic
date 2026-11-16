@@ -1,0 +1,10 @@
+# Rust 构建产物
+/target
+
+# IDE / 本地工具目录
+/.idea/
+/.meituan-catpaw/
+/.workbuddy/
+
+# 临时测试产物
+/output.jpg

@@ -1,0 +1,1407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Akashic · 桌面相册整理</title>
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />
+    <style>
+        /* ===== 全局重置 ===== */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #1A2634;
+            --primary-light: #2A3A4E;
+            --primary-lighter: #3A506A;
+            --gold: #C9A96E;
+            --gold-light: #E8D5A8;
+            --gold-pale: #F5EDDA;
+            --bg-warm: #F5F2ED;
+            --bg-white: #FFFFFF;
+            --bg-sidebar: #1A2634;
+            --text-primary: #1A2634;
+            --text-secondary: #5A6A7A;
+            --text-light: #8A9AAA;
+            --text-white: #F0EDE8;
+            --border-light: #E8E4DE;
+            --shadow-card: 0 4px 20px rgba(0, 0, 0, 0.06);
+            --shadow-modal: 0 20px 60px rgba(0, 0, 0, 0.4);
+            --radius-card: 12px;
+            --radius-btn: 8px;
+            --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+            --transition-slow: all 0.25s ease-out;
+        }
+
+        body {
+            font-family: var(--font-sans);
+            background: #E8E4DE;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 40px;
+        }
+
+        /* ===== 桌面窗口容器 ===== */
+        .window {
+            width: 1200px;
+            max-width: 98vw;
+            height: 780px;
+            max-height: 92vh;
+            background: var(--bg-white);
+            border-radius: 16px;
+            box-shadow: 0 24px 80px rgba(26, 38, 52, 0.35);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* ===== 标题栏 ===== */
+        .titlebar {
+            height: 48px;
+            background: var(--bg-sidebar);
+            display: flex;
+            align-items: center;
+            padding: 0 20px;
+            flex-shrink: 0;
+            gap: 16px;
+            user-select: none;
+        }
+        .titlebar .dot-group {
+            display: flex;
+            gap: 8px;
+        }
+        .titlebar .dot {
+            width: 13px;
+            height: 13px;
+            border-radius: 50%;
+            background: #5A6A7A;
+        }
+        .titlebar .dot.red {
+            background: #E0544C;
+        }
+        .titlebar .dot.yellow {
+            background: #E5B84C;
+        }
+        .titlebar .dot.green {
+            background: #5CB85C;
+        }
+        .titlebar .app-title {
+            color: var(--text-white);
+            font-weight: 600;
+            font-size: 14px;
+            letter-spacing: 0.5px;
+            margin-left: 8px;
+            flex: 1;
+        }
+        .titlebar .app-title span {
+            color: var(--gold);
+        }
+        .titlebar .status-tag {
+            font-size: 11px;
+            color: var(--text-light);
+            background: rgba(255, 255, 255, 0.06);
+            padding: 3px 14px;
+            border-radius: 20px;
+        }
+
+        /* ===== 主体 ===== */
+        .main-layout {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* ===== 侧边栏 ===== */
+        .sidebar {
+            width: 200px;
+            background: var(--bg-sidebar);
+            padding: 16px 0 20px 0;
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            overflow-y: auto;
+        }
+        .sidebar::-webkit-scrollbar {
+            width: 2px;
+        }
+        .sidebar::-webkit-scrollbar-thumb {
+            background: var(--primary-lighter);
+            border-radius: 10px;
+        }
+
+        .sidebar .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 11px 20px;
+            color: rgba(255, 255, 255, 0.5);
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: var(--transition-slow);
+            border-left: 3px solid transparent;
+            background: none;
+            border-right: none;
+            border-top: none;
+            border-bottom: none;
+            width: 100%;
+            font-family: var(--font-sans);
+            text-align: left;
+        }
+        .sidebar .nav-item i {
+            width: 20px;
+            font-size: 16px;
+            text-align: center;
+        }
+        .sidebar .nav-item:hover {
+            color: rgba(255, 255, 255, 0.75);
+            background: rgba(255, 255, 255, 0.04);
+        }
+        .sidebar .nav-item.active {
+            color: var(--gold);
+            border-left-color: var(--gold);
+            background: rgba(201, 169, 110, 0.08);
+        }
+        .sidebar .nav-item .badge {
+            margin-left: auto;
+            background: rgba(255, 255, 255, 0.08);
+            font-size: 10px;
+            padding: 1px 10px;
+            border-radius: 20px;
+            color: rgba(255, 255, 255, 0.5);
+        }
+        .sidebar .nav-item.active .badge {
+            background: rgba(201, 169, 110, 0.2);
+            color: var(--gold);
+        }
+        .sidebar .divider {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.06);
+            margin: 12px 20px;
+        }
+        .sidebar .sidebar-footer {
+            margin-top: auto;
+            padding: 0 20px;
+        }
+        .sidebar .sidebar-footer .privacy-badge {
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.25);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .sidebar .sidebar-footer .privacy-badge i {
+            font-size: 12px;
+        }
+
+        /* ===== 内容区 ===== */
+        .content {
+            flex: 1;
+            background: var(--bg-warm);
+            padding: 20px 24px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ===== 页面切换 ===== */
+        .page {
+            display: none;
+            animation: fadeUp 0.25s ease-out;
+            flex: 1;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .page.active {
+            display: flex;
+        }
+
+        @keyframes fadeUp {
+            0% {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+            100% {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* ===== 页面头部 ===== */
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            flex-shrink: 0;
+        }
+        .page-header h1 {
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--primary);
+        }
+        .page-header h1 small {
+            font-size: 13px;
+            font-weight: 400;
+            color: var(--text-secondary);
+            margin-left: 10px;
+        }
+        .page-header .actions {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        /* ===== 按钮 ===== */
+        .btn {
+            padding: 7px 16px;
+            border-radius: var(--radius-btn);
+            border: none;
+            font-weight: 500;
+            font-size: 13px;
+            cursor: pointer;
+            transition: var(--transition-slow);
+            font-family: var(--font-sans);
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .btn-primary {
+            background: var(--primary);
+            color: #fff;
+        }
+        .btn-primary:hover {
+            background: var(--primary-light);
+        }
+        .btn-gold {
+            background: var(--gold);
+            color: var(--primary);
+        }
+        .btn-gold:hover {
+            background: #B8954A;
+        }
+        .btn-outline {
+            background: transparent;
+            border: 1.5px solid var(--border-light);
+            color: var(--text-secondary);
+        }
+        .btn-outline:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+        .btn-ghost {
+            background: transparent;
+            color: var(--text-light);
+        }
+        .btn-ghost:hover {
+            color: var(--text-secondary);
+            background: var(--bg-warm);
+        }
+        .btn-sm {
+            font-size: 11px;
+            padding: 4px 12px;
+        }
+        .btn-danger {
+            background: #E0544C;
+            color: #fff;
+        }
+        .btn-danger:hover {
+            background: #C0392B;
+        }
+
+        /* ================================================ */
+        /* ===== 相册库页面 (左树 + 右网格) ===== */
+        /* ================================================ */
+        .library-layout {
+            display: flex;
+            gap: 16px;
+            flex: 1;
+            min-height: 0;
+        }
+
+        /* ---- 左侧目录树 ---- */
+        .tree-panel {
+            width: 220px;
+            flex-shrink: 0;
+            background: var(--bg-white);
+            border-radius: var(--radius-card);
+            padding: 12px 6px 12px 12px;
+            box-shadow: var(--shadow-card);
+            overflow-y: auto;
+        }
+        .tree-panel::-webkit-scrollbar {
+            width: 3px;
+        }
+        .tree-panel::-webkit-scrollbar-thumb {
+            background: var(--border-light);
+            border-radius: 10px;
+        }
+
+        .tree-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: var(--transition-slow);
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        .tree-item:hover {
+            background: var(--bg-warm);
+        }
+        .tree-item.active {
+            background: var(--gold-pale);
+            color: var(--primary);
+            font-weight: 500;
+        }
+        .tree-item .count {
+            margin-left: auto;
+            font-size: 11px;
+            color: var(--text-light);
+        }
+        .tree-item .arrow {
+            font-size: 10px;
+            color: var(--text-light);
+            transition: var(--transition-slow);
+        }
+        .tree-item .arrow.open {
+            transform: rotate(90deg);
+        }
+        .tree-children {
+            padding-left: 20px;
+            display: none;
+        }
+        .tree-children.open {
+            display: block;
+        }
+
+        /* ---- 右侧照片网格 ---- */
+        .grid-panel {
+            flex: 1;
+            background: var(--bg-white);
+            border-radius: var(--radius-card);
+            box-shadow: var(--shadow-card);
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .grid-toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            flex-shrink: 0;
+        }
+        .grid-toolbar .info {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        .grid-toolbar .info strong {
+            color: var(--primary);
+        }
+        .grid-toolbar .view-options {
+            display: flex;
+            gap: 4px;
+        }
+        .grid-toolbar .view-options button {
+            background: none;
+            border: 1px solid var(--border-light);
+            border-radius: 4px;
+            padding: 4px 8px;
+            cursor: pointer;
+            color: var(--text-light);
+            transition: var(--transition-slow);
+            font-size: 13px;
+        }
+        .grid-toolbar .view-options button:hover {
+            border-color: var(--gold);
+            color: var(--primary);
+        }
+        .grid-toolbar .view-options button.active {
+            border-color: var(--gold);
+            color: var(--gold);
+            background: var(--gold-pale);
+        }
+
+        /* ---- 照片网格 ---- */
+        .photo-grid {
+            flex: 1;
+            overflow-y: auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 12px;
+            align-content: start;
+            padding-right: 4px;
+        }
+        .photo-grid::-webkit-scrollbar {
+            width: 4px;
+        }
+        .photo-grid::-webkit-scrollbar-thumb {
+            background: var(--border-light);
+            border-radius: 10px;
+        }
+
+        .photo-thumb {
+            aspect-ratio: 1 / 1;
+            background: var(--bg-warm);
+            border-radius: 8px;
+            overflow: hidden;
+            cursor: pointer;
+            position: relative;
+            transition: var(--transition-slow);
+            border: 2px solid transparent;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 32px;
+            color: var(--text-light);
+        }
+        .photo-thumb:hover {
+            border-color: var(--gold);
+            transform: scale(1.02);
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+            z-index: 2;
+        }
+        .photo-thumb.selected {
+            border-color: var(--gold);
+        }
+        .photo-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .photo-thumb .thumb-label {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(26, 38, 52, 0.7);
+            color: #fff;
+            font-size: 10px;
+            padding: 3px 8px;
+            opacity: 0;
+            transition: var(--transition-slow);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .photo-thumb:hover .thumb-label {
+            opacity: 1;
+        }
+        .photo-thumb .check {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: var(--gold);
+            color: #fff;
+            font-size: 11px;
+            display: none;
+            align-items: center;
+            justify-content: center;
+        }
+        .photo-thumb.selected .check {
+            display: flex;
+        }
+
+        /* ================================================ */
+        /* ===== 照片详情模态窗 ===== */
+        /* ================================================ */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(8px);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            padding: 40px;
+            animation: fadeIn 0.25s ease-out;
+        }
+        .modal-overlay.open {
+            display: flex;
+        }
+
+        @keyframes fadeIn {
+            0% {
+                opacity: 0;
+            }
+            100% {
+                opacity: 1;
+            }
+        }
+
+        .modal {
+            background: var(--bg-white);
+            border-radius: 16px;
+            max-width: 1000px;
+            width: 100%;
+            max-height: 90vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: var(--shadow-modal);
+            animation: slideUp 0.3s ease-out;
+        }
+
+        @keyframes slideUp {
+            0% {
+                opacity: 0;
+                transform: scale(0.96) translateY(20px);
+            }
+            100% {
+                opacity: 1;
+                transform: scale(1) translateY(0);
+            }
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 20px;
+            border-bottom: 1px solid var(--border-light);
+            flex-shrink: 0;
+        }
+        .modal-header .filename {
+            font-weight: 600;
+            font-size: 15px;
+            color: var(--primary);
+        }
+        .modal-header .nav-info {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        .modal-header .close-btn {
+            background: none;
+            border: none;
+            font-size: 22px;
+            color: var(--text-light);
+            cursor: pointer;
+            padding: 0 4px;
+            transition: var(--transition-slow);
+        }
+        .modal-header .close-btn:hover {
+            color: var(--primary);
+        }
+
+        .modal-body {
+            display: flex;
+            flex: 1;
+            min-height: 0;
+        }
+
+        .modal-image {
+            flex: 1;
+            background: var(--bg-warm);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            min-height: 300px;
+            position: relative;
+        }
+        .modal-image .main-img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border-radius: 4px;
+        }
+        .modal-image .nav-arrow {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            background: rgba(26, 38, 52, 0.6);
+            color: #fff;
+            border: none;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            font-size: 18px;
+            cursor: pointer;
+            transition: var(--transition-slow);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-image .nav-arrow:hover {
+            background: rgba(26, 38, 52, 0.85);
+        }
+        .modal-image .nav-arrow.prev {
+            left: 12px;
+        }
+        .modal-image .nav-arrow.next {
+            right: 12px;
+        }
+
+        .modal-info {
+            width: 260px;
+            flex-shrink: 0;
+            padding: 18px 20px;
+            border-left: 1px solid var(--border-light);
+            overflow-y: auto;
+            font-size: 13px;
+        }
+        .modal-info::-webkit-scrollbar {
+            width: 3px;
+        }
+        .modal-info::-webkit-scrollbar-thumb {
+            background: var(--border-light);
+            border-radius: 10px;
+        }
+        .modal-info .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 0;
+            border-bottom: 1px solid var(--border-light);
+        }
+        .modal-info .info-row .label {
+            color: var(--text-secondary);
+        }
+        .modal-info .info-row .value {
+            color: var(--primary);
+            font-weight: 500;
+        }
+        .modal-info .info-section {
+            margin-top: 12px;
+        }
+        .modal-info .info-section .title {
+            font-weight: 600;
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+        .modal-info .tag-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .modal-info .tag-list .tag {
+            background: var(--gold-pale);
+            color: var(--primary);
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+        }
+        .modal-info .action-row {
+            display: flex;
+            gap: 6px;
+            margin-top: 14px;
+            flex-wrap: wrap;
+        }
+        .modal-info .action-row .btn {
+            flex: 1;
+            justify-content: center;
+            font-size: 12px;
+            padding: 6px 10px;
+            min-width: 60px;
+        }
+
+        /* ===== 工具页面复用网格 ===== */
+        .tool-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .tool-card {
+            background: var(--bg-white);
+            border-radius: var(--radius-card);
+            padding: 16px;
+            box-shadow: var(--shadow-card);
+            cursor: pointer;
+            transition: var(--transition-slow);
+            border: 2px solid transparent;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .tool-card:hover {
+            border-color: var(--gold-light);
+            transform: translateY(-2px);
+        }
+        .tool-card .icon {
+            font-size: 26px;
+            color: var(--primary-lighter);
+            width: 40px;
+            text-align: center;
+            flex-shrink: 0;
+        }
+        .tool-card .info .name {
+            font-weight: 600;
+            font-size: 14px;
+        }
+        .tool-card .info .desc {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        .tool-card .badge {
+            margin-left: auto;
+            background: var(--gold-pale);
+            color: var(--primary);
+            font-size: 11px;
+            border-radius: 20px;
+            padding: 2px 14px;
+            font-weight: 600;
+        }
+
+        .story-scroll {
+            display: flex;
+            gap: 12px;
+            overflow-x: auto;
+            padding-bottom: 6px;
+        }
+        .story-scroll::-webkit-scrollbar {
+            height: 3px;
+        }
+        .story-scroll::-webkit-scrollbar-thumb {
+            background: var(--border-light);
+            border-radius: 10px;
+        }
+        .story-card {
+            min-width: 140px;
+            background: var(--bg-white);
+            border-radius: var(--radius-card);
+            padding: 14px;
+            box-shadow: var(--shadow-card);
+            text-align: center;
+            flex-shrink: 0;
+            cursor: pointer;
+            transition: var(--transition-slow);
+        }
+        .story-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
+        }
+        .story-card .emoji {
+            font-size: 28px;
+        }
+        .story-card .sname {
+            font-weight: 600;
+            font-size: 13px;
+            margin-top: 4px;
+        }
+        .story-card .scount {
+            font-size: 11px;
+            color: var(--text-light);
+        }
+
+        /* ===== 其他页面占位 ===== */
+        .placeholder-content {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-light);
+            font-size: 15px;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .placeholder-content i {
+            font-size: 48px;
+            color: var(--border-light);
+        }
+
+        /* ===== 响应式 ===== */
+        @media (max-width: 900px) {
+            .tree-panel {
+                width: 160px;
+            }
+            .modal-info {
+                width: 200px;
+            }
+            .photo-grid {
+                grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+                gap: 8px;
+            }
+        }
+        @media (max-width: 700px) {
+            .library-layout {
+                flex-direction: column;
+            }
+            .tree-panel {
+                width: 100%;
+                max-height: 120px;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 4px;
+                padding: 8px 12px;
+            }
+            .tree-item {
+                padding: 4px 10px;
+                font-size: 12px;
+            }
+            .tree-children {
+                display: none !important;
+            }
+            .modal-body {
+                flex-direction: column;
+            }
+            .modal-info {
+                width: 100%;
+                border-left: none;
+                border-top: 1px solid var(--border-light);
+                max-height: 180px;
+            }
+            .modal-image .nav-arrow {
+                width: 30px;
+                height: 30px;
+                font-size: 14px;
+            }
+            .modal-image .nav-arrow.prev {
+                left: 4px;
+            }
+            .modal-image .nav-arrow.next {
+                right: 4px;
+            }
+            .window {
+                padding: 0;
+                border-radius: 0;
+                height: 100vh;
+                max-height: 100vh;
+            }
+            body {
+                padding: 0;
+            }
+            .titlebar .dot-group {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="window">
+
+        <!-- ===== 标题栏 ===== -->
+        <div class="titlebar">
+            <div class="dot-group">
+                <span class="dot red"></span>
+                <span class="dot yellow"></span>
+                <span class="dot green"></span>
+            </div>
+            <div class="app-title">Akashic <span>·</span> 相册整理师</div>
+            <span class="status-tag"><i class="fas fa-shield-alt" style="margin-right:4px;"></i> 本地 · 离线</span>
+        </div>
+
+        <!-- ===== 主体 ===== -->
+        <div class="main-layout">
+
+            <!-- ===== 侧边栏 ===== -->
+            <nav class="sidebar">
+                <button class="nav-item" data-page="home" onclick="switchPage('home')">
+                    <i class="fas fa-home"></i><span>首页</span>
+                </button>
+                <button class="nav-item" data-page="organize" onclick="switchPage('organize')">
+                    <i class="fas fa-magic"></i><span>智能整理</span>
+                    <span class="badge">12</span>
+                </button>
+                <button class="nav-item active" data-page="library" onclick="switchPage('library')">
+                    <i class="fas fa-images"></i><span>相册库</span>
+                    <span class="badge">1,247</span>
+                </button>
+                <button class="nav-item" data-page="rename" onclick="switchPage('rename')">
+                    <i class="fas fa-pen-fancy"></i><span>重命名</span>
+                </button>
+                <button class="nav-item" data-page="trash" onclick="switchPage('trash')">
+                    <i class="fas fa-trash-alt"></i><span>回收站</span>
+                    <span class="badge">4</span>
+                </button>
+
+                <div class="divider"></div>
+
+                <button class="nav-item" onclick="alert('⚙️ 设置面板')">
+                    <i class="fas fa-sliders-h"></i><span>设置</span>
+                </button>
+
+                <div class="sidebar-footer">
+                    <div class="privacy-badge">
+                        <i class="fas fa-lock"></i>
+                        <span>100% 本地 · 零上传</span>
+                    </div>
+                </div>
+            </nav>
+
+            <!-- ===== 内容区 ===== -->
+            <div class="content">
+
+                <!-- ========== 首页 ========== -->
+                <div class="page" id="page-home">
+                    <div class="page-header">
+                        <h1>📊 相册概览 <small>上次整理：昨天 · 清理了 156 张</small></h1>
+                        <div class="actions">
+                            <button class="btn btn-primary" onclick="switchPage('organize')"><i class="fas fa-magic"></i> 开始整理</button>
+                        </div>
+                    </div>
+                    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px;">
+                        <div style="background:#fff;border-radius:12px;padding:18px 20px;box-shadow:var(--shadow-card);">
+                            <div style="font-size:28px;font-weight:700;color:var(--primary);">8,432</div>
+                            <div style="font-size:12px;color:var(--text-secondary);">📸 总照片</div>
+                        </div>
+                        <div style="background:#fff;border-radius:12px;padding:18px 20px;box-shadow:var(--shadow-card);">
+                            <div style="font-size:28px;font-weight:700;color:var(--primary);">42.6 GB</div>
+                            <div style="font-size:12px;color:var(--text-secondary);">💾 占用空间</div>
+                        </div>
+                        <div style="background:#fff;border-radius:12px;padding:18px 20px;box-shadow:var(--shadow-card);">
+                            <div style="font-size:28px;font-weight:700;color:var(--gold);">~400</div>
+                            <div style="font-size:12px;color:var(--text-secondary);">🧹 可清理预估</div>
+                        </div>
+                        <div style="background:#fff;border-radius:12px;padding:18px 20px;box-shadow:var(--shadow-card);">
+                            <div style="font-size:28px;font-weight:700;color:var(--primary);">1,247</div>
+                            <div style="font-size:12px;color:var(--text-secondary);">📂 已归档</div>
+                        </div>
+                    </div>
+                    <div style="background:#fff;border-radius:12px;padding:18px 20px;box-shadow:var(--shadow-card);flex:1;">
+                        <div style="font-size:13px;font-weight:600;color:var(--text-secondary);margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                            <span>📋 最近整理记录</span>
+                            <button class="btn btn-sm btn-ghost">查看全部</button>
+                        </div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                            <div style="display:flex;justify-content:space-between;padding:10px 14px;background:var(--bg-warm);border-radius:8px;font-size:13px;">
+                                <span style="color:var(--text-secondary);">🗑️ 批量删除</span>
+                                <span style="font-weight:600;">156 张 · 2.3 GB</span>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;padding:10px 14px;background:var(--bg-warm);border-radius:8px;font-size:13px;">
+                                <span style="color:var(--text-secondary);">🏷️ 重命名</span>
+                                <span style="font-weight:600;">328 张 · 日本旅行</span>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;padding:10px 14px;background:var(--bg-warm);border-radius:8px;font-size:13px;">
+                                <span style="color:var(--text-secondary);">📂 归档</span>
+                                <span style="font-weight:600;">203 张 → 三亚旅行</span>
+                            </div>
+                            <div style="display:flex;justify-content:space-between;padding:10px 14px;background:var(--bg-warm);border-radius:8px;font-size:13px;">
+                                <span style="color:var(--text-secondary);">🧹 清理截图</span>
+                                <span style="font-weight:600;">89 张 · 0.6 GB</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== 智能整理 ========== -->
+                <div class="page" id="page-organize">
+                    <div class="page-header">
+                        <h1>🔍 智能整理 <small>选择工具开始清理</small></h1>
+                        <div class="actions">
+                            <button class="btn btn-outline btn-sm"><i class="fas fa-sync-alt"></i> 重新扫描</button>
+                        </div>
+                    </div>
+                    <div class="tool-grid">
+                        <div class="tool-card" onclick="switchPage('library')">
+                            <div class="icon"><i class="fas fa-copy"></i></div>
+                            <div class="info"><div class="name">相似照片</div><div class="desc">连拍 &amp; 重复角度</div></div>
+                            <span class="badge">12组</span>
+                        </div>
+                        <div class="tool-card" onclick="switchPage('library')">
+                            <div class="icon"><i class="fas fa-eye-slash"></i></div>
+                            <div class="info"><div class="name">模糊检测</div><div class="desc">手抖 / 失焦</div></div>
+                            <span class="badge">43张</span>
+                        </div>
+                        <div class="tool-card" onclick="switchPage('library')">
+                            <div class="icon"><i class="fas fa-crop-alt"></i></div>
+                            <div class="info"><div class="name">截图筛选</div><div class="desc">屏幕录制 · 截屏</div></div>
+                            <span class="badge">218张</span>
+                        </div>
+                        <div class="tool-card" onclick="switchPage('library')">
+                            <div class="icon"><i class="fas fa-file-alt"></i></div>
+                            <div class="info"><div class="name">大文件</div><div class="desc">按大小排序</div></div>
+                            <span class="badge">34个</span>
+                        </div>
+                        <div class="tool-card" onclick="switchPage('rename')">
+                            <div class="icon"><i class="fas fa-pen-fancy"></i></div>
+                            <div class="info"><div class="name">智能重命名</div><div class="desc">统一命名风格</div></div>
+                            <span class="badge" style="background:var(--gold);color:#fff;">⭐</span>
+                        </div>
+                        <div class="tool-card" onclick="switchPage('library')">
+                            <div class="icon"><i class="fas fa-folder-tree"></i></div>
+                            <div class="info"><div class="name">智能归档</div><div class="desc">自动归入目录</div></div>
+                            <span class="badge" style="background:var(--gold);color:#fff;">⭐</span>
+                        </div>
+                    </div>
+                    <div style="background:#fff;border-radius:12px;padding:16px 18px;box-shadow:var(--shadow-card);flex:1;">
+                        <div style="font-size:13px;font-weight:600;color:var(--text-secondary);margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                            <span>📖 自动生成的故事</span>
+                            <button class="btn btn-sm btn-ghost">查看全部</button>
+                        </div>
+                        <div class="story-scroll">
+                            <div class="story-card" onclick="switchPage('library')"><div class="emoji">🇯🇵</div><div class="sname">日本旅行</div><div class="scount">85 张 · 2024.08</div></div>
+                            <div class="story-card" onclick="switchPage('library')"><div class="emoji">🎂</div><div class="sname">生日派对</div><div class="scount">34 张 · 2024.07</div></div>
+                            <div class="story-card" onclick="switchPage('library')"><div class="emoji">🏔️</div><div class="sname">四姑娘山</div><div class="scount">47 张 · 2024.06</div></div>
+                            <div class="story-card" onclick="switchPage('library')"><div class="emoji">🏖️</div><div class="sname">三亚旅行</div><div class="scount">203 张 · 2023.12</div></div>
+                            <div class="story-card" onclick="switchPage('library')"><div class="emoji">🎄</div><div class="sname">圣诞聚餐</div><div class="scount">28 张 · 2023.12</div></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== 相册库 (左树 + 右网格) ========== -->
+                <div class="page active" id="page-library">
+                    <div class="page-header">
+                        <h1>🖼️ 相册库 <small>日本旅行 · 85 张</small></h1>
+                        <div class="actions">
+                            <button class="btn btn-outline btn-sm"><i class="fas fa-edit"></i> 重命名</button>
+                            <button class="btn btn-outline btn-sm"><i class="fas fa-folder-plus"></i> 归档</button>
+                            <button class="btn btn-primary btn-sm"><i class="fas fa-check"></i> 选择</button>
+                        </div>
+                    </div>
+
+                    <div class="library-layout">
+                        <!-- 左侧目录树 -->
+                        <div class="tree-panel">
+                            <div class="tree-item active" onclick="switchLibraryFolder(this, '日本旅行 · 85 张')">
+                                <span>📁 日本旅行</span>
+                                <span class="count">85</span>
+                            </div>
+                            <div class="tree-item" onclick="switchLibraryFolder(this, '生日派对 · 34 张')">
+                                <span>📁 生日派对</span>
+                                <span class="count">34</span>
+                            </div>
+                            <div class="tree-item" onclick="switchLibraryFolder(this, '四姑娘山 · 47 张')">
+                                <span>📁 四姑娘山</span>
+                                <span class="count">47</span>
+                            </div>
+                            <div class="tree-item" onclick="toggleTree(this)">
+                                <span class="arrow open">▶</span>
+                                <span>📁 2024年</span>
+                                <span class="count">328</span>
+                            </div>
+                            <div class="tree-children open">
+                                <div class="tree-item" onclick="switchLibraryFolder(this, '青岛旅行 · 156 张')">
+                                    <span>📁 青岛旅行</span>
+                                    <span class="count">156</span>
+                                </div>
+                                <div class="tree-item" onclick="switchLibraryFolder(this, '公司团建 · 47 张')">
+                                    <span>📁 公司团建</span>
+                                    <span class="count">47</span>
+                                </div>
+                            </div>
+                            <div class="tree-item" onclick="toggleTree(this)">
+                                <span class="arrow">▶</span>
+                                <span>📁 2023年</span>
+                                <span class="count">892</span>
+                            </div>
+                            <div class="tree-children">
+                                <div class="tree-item" onclick="switchLibraryFolder(this, '三亚旅行 · 203 张')">
+                                    <span>📁 三亚旅行</span>
+                                    <span class="count">203</span>
+                                </div>
+                                <div class="tree-item" onclick="switchLibraryFolder(this, '圣诞聚餐 · 28 张')">
+                                    <span>📁 圣诞聚餐</span>
+                                    <span class="count">28</span>
+                                </div>
+                            </div>
+                            <div class="tree-item" onclick="switchLibraryFolder(this, '所有照片 · 8,432 张')" style="margin-top:8px;border-top:1px solid var(--border-light);padding-top:8px;">
+                                <span>📷 所有照片</span>
+                                <span class="count">8,432</span>
+                            </div>
+                        </div>
+
+                        <!-- 右侧照片网格 -->
+                        <div class="grid-panel">
+                            <div class="grid-toolbar">
+                                <span class="info">共 <strong id="photoCount">85</strong> 张照片</span>
+                                <div class="view-options">
+                                    <button class="active" title="网格视图"><i class="fas fa-th"></i></button>
+                                    <button title="列表视图"><i class="fas fa-list"></i></button>
+                                    <button title="时间线"><i class="fas fa-clock"></i></button>
+                                </div>
+                            </div>
+                            <div class="photo-grid" id="photoGrid">
+                                <!-- 由 JavaScript 生成 -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ========== 重命名 ========== -->
+                <div class="page" id="page-rename">
+                    <div class="page-header">
+                        <h1>✏️ 智能重命名 <small>统一命名风格</small></h1>
+                        <div class="actions">
+                            <span style="font-size:13px;color:var(--text-light);">已选 <strong style="color:var(--primary);">328</strong> 张</span>
+                        </div>
+                    </div>
+                    <div class="placeholder-content">
+                        <i class="fas fa-pen-fancy"></i>
+                        <div>重命名功能 — 从相册库选择照片后使用</div>
+                        <button class="btn btn-outline" onclick="switchPage('library')">← 去相册库选照片</button>
+                    </div>
+                </div>
+
+                <!-- ========== 回收站 ========== -->
+                <div class="page" id="page-trash">
+                    <div class="page-header">
+                        <h1>🗑️ 回收站 <small>30天后自动清空</small></h1>
+                        <div class="actions">
+                            <button class="btn btn-outline btn-sm" style="color:#C0392B;border-color:#F5D6D3;" onclick="alert('🗑️ 回收站已清空。')"><i class="fas fa-trash-alt"></i> 清空</button>
+                        </div>
+                    </div>
+                    <div class="placeholder-content">
+                        <i class="fas fa-trash-alt"></i>
+                        <div>回收站共 4 张照片</div>
+                        <button class="btn btn-outline btn-sm" onclick="alert('↩️ 已全部恢复')"><i class="fas fa-undo"></i> 全部恢复</button>
+                    </div>
+                </div>
+
+            </div><!-- end content -->
+        </div><!-- end main-layout -->
+    </div><!-- end window -->
+
+    <!-- ===== 照片详情模态窗 ===== -->
+    <div class="modal-overlay" id="photoModal">
+        <div class="modal">
+            <div class="modal-header">
+                <span class="filename" id="modalFilename">IMG_20240815_094523.jpg</span>
+                <span class="nav-info" id="modalNavInfo">1 / 85</span>
+                <button class="close-btn" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-image">
+                    <button class="nav-arrow prev" onclick="navigatePhoto(-1)">‹</button>
+                    <div style="display:flex;flex-direction:column;align-items:center;gap:12px;">
+                        <div style="font-size:120px;color:var(--primary-lighter);" id="modalEmoji">🏔️</div>
+                        <div style="font-size:13px;color:var(--text-light);">模拟预览 · 实际为照片缩略图</div>
+                    </div>
+                    <button class="nav-arrow next" onclick="navigatePhoto(1)">›</button>
+                </div>
+                <div class="modal-info">
+                    <div class="info-row"><span class="label">文件名</span><span class="value" id="infoFilename">IMG_20240815_094523.jpg</span></div>
+                    <div class="info-row"><span class="label">拍摄日期</span><span class="value" id="infoDate">2024-08-15 09:45</span></div>
+                    <div class="info-row"><span class="label">尺寸</span><span class="value" id="infoSize">4032 × 3024</span></div>
+                    <div class="info-row"><span class="label">文件大小</span><span class="value" id="infoFileSize">4.2 MB</span></div>
+                    <div class="info-row"><span class="label">设备</span><span class="value" id="infoDevice">iPhone 15 Pro</span></div>
+                    <div class="info-row"><span class="label">地点</span><span class="value" id="infoLocation">日本 · 富士山</span></div>
+
+                    <div class="info-section">
+                        <div class="title">🏷️ 标签</div>
+                        <div class="tag-list" id="infoTags">
+                            <span class="tag">旅行</span>
+                            <span class="tag">风景</span>
+                            <span class="tag">富士山</span>
+                            <span class="tag">2024</span>
+                        </div>
+                    </div>
+
+                    <div class="info-section">
+                        <div class="title">📂 所属相册</div>
+                        <div style="font-size:13px;color:var(--text-secondary);">日本旅行</div>
+                    </div>
+
+                    <div class="action-row">
+                        <button class="btn btn-primary btn-sm" onclick="alert('✅ 已标记收藏')"><i class="far fa-star"></i> 收藏</button>
+                        <button class="btn btn-outline btn-sm" onclick="alert('🏷️ 编辑标签')"><i class="fas fa-tag"></i> 标签</button>
+                        <button class="btn btn-outline btn-sm" onclick="alert('📂 移动至...')"><i class="fas fa-folder-open"></i> 移动</button>
+                        <button class="btn btn-danger btn-sm" onclick="if(confirm('确定删除这张照片吗？'))alert('🗑️ 已移入回收站')"><i class="fas fa-trash"></i></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ===== 模拟照片数据 =====
+        const photoData = [
+            { name: 'IMG_20240815_094523.jpg', date: '2024-08-15 09:45', size: '4032×3024', fileSize: '4.2 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 富士山', tags: ['旅行', '风景', '富士山', '2024'], emoji: '🏔️' },
+            { name: 'IMG_20240815_102134.jpg', date: '2024-08-15 10:21', size: '4032×3024', fileSize: '3.8 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 河口湖', tags: ['旅行', '风景', '河口湖'], emoji: '🌊' },
+            { name: 'IMG_20240815_143022.jpg', date: '2024-08-15 14:30', size: '3024×4032', fileSize: '5.1 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 浅草寺', tags: ['旅行', '寺庙', '浅草'], emoji: '⛩️' },
+            { name: 'IMG_20240816_082145.jpg', date: '2024-08-16 08:21', size: '4032×3024', fileSize: '6.3 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 新干线', tags: ['旅行', '列车', '新干线'], emoji: '🚅' },
+            { name: 'IMG_20240816_120033.jpg', date: '2024-08-16 12:00', size: '4032×3024', fileSize: '4.7 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 京都', tags: ['旅行', '美食', '京都'], emoji: '🍣' },
+            { name: 'IMG_20240816_163845.jpg', date: '2024-08-16 16:38', size: '3024×4032', fileSize: '3.2 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 伏见稻荷', tags: ['旅行', '神社', '鸟居'], emoji: '⛩️' },
+            { name: 'IMG_20240817_091234.jpg', date: '2024-08-17 09:12', size: '4032×3024', fileSize: '5.8 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 奈良', tags: ['旅行', '鹿', '奈良'], emoji: '🦌' },
+            { name: 'IMG_20240817_141522.jpg', date: '2024-08-17 14:15', size: '4032×3024', fileSize: '4.4 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 大阪', tags: ['旅行', '城市', '大阪'], emoji: '🏙️' },
+            { name: 'IMG_20240818_103045.jpg', date: '2024-08-18 10:30', size: '3024×4032', fileSize: '3.9 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 东京塔', tags: ['旅行', '地标', '东京'], emoji: '🗼' },
+            { name: 'IMG_20240818_193022.jpg', date: '2024-08-18 19:30', size: '4032×3024', fileSize: '2.8 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 涩谷', tags: ['旅行', '夜景', '涩谷'], emoji: '🌃' },
+            { name: 'IMG_20240819_075634.jpg', date: '2024-08-19 07:56', size: '4032×3024', fileSize: '6.1 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 镰仓', tags: ['旅行', '海岸', '镰仓'], emoji: '🌅' },
+            { name: 'IMG_20240819_123045.jpg', date: '2024-08-19 12:30', size: '4032×3024', fileSize: '3.5 MB', device: 'iPhone 15 Pro',
+                location: '日本 · 江之岛', tags: ['旅行', '海岛', '江之岛'], emoji: '🏝️' },
+        ];
+
+        let currentPhotos = photoData;
+        let currentIndex = 0;
+        let selectedIds = new Set();
+
+        // ===== 渲染照片网格 =====
+        function renderGrid(photos) {
+            const grid = document.getElementById('photoGrid');
+            grid.innerHTML = '';
+            photos.forEach((photo, index) => {
+                const div = document.createElement('div');
+                div.className = 'photo-thumb';
+                div.dataset.index = index;
+                div.innerHTML = `
+                    <div style="font-size:48px;color:var(--primary-lighter);">${photo.emoji || '📷'}</div>
+                    <span class="thumb-label">${photo.name}</span>
+                    <span class="check">✓</span>
+                `;
+                div.addEventListener('click', function(e) {
+                    // 如果按住 Ctrl/Cmd 则切换选择，否则打开详情
+                    if (e.ctrlKey || e.metaKey) {
+                        this.classList.toggle('selected');
+                        const id = this.dataset.index;
+                        if (selectedIds.has(id)) selectedIds.delete(id);
+                        else selectedIds.add(id);
+                        updateSelectionBar();
+                    } else {
+                        openModal(index);
+                    }
+                });
+                grid.appendChild(div);
+            });
+            document.getElementById('photoCount').textContent = photos.length;
+            selectedIds.clear();
+            updateSelectionBar();
+        }
+
+        // ===== 更新选中状态 =====
+        function updateSelectionBar() {
+            const count = selectedIds.size;
+            const header = document.querySelector('#page-library .page-header .actions');
+            if (header) {
+                const btn = header.querySelector('.btn-primary');
+                if (btn) {
+                    btn.textContent = count > 0 ? `已选 ${count} 张` : '选择';
+                }
+            }
+        }
+
+        // ===== 切换目录树文件夹 =====
+        function switchLibraryFolder(el, label) {
+            document.querySelectorAll('.tree-panel .tree-item').forEach(item => item.classList.remove('active'));
+            el.classList.add('active');
+            // 更新标题
+            const header = document.querySelector('#page-library .page-header h1');
+            if (header) {
+                header.innerHTML = `🖼️ 相册库 <small>${label}</small>`;
+            }
+            // 模拟切换不同照片集
+            if (label.includes('日本旅行')) {
+                currentPhotos = photoData;
+            } else if (label.includes('生日派对')) {
+                currentPhotos = photoData.slice(0, 6);
+            } else if (label.includes('四姑娘山')) {
+                currentPhotos = photoData.slice(3, 8);
+            } else if (label.includes('青岛旅行')) {
+                currentPhotos = photoData.slice(5, 10);
+            } else if (label.includes('三亚旅行')) {
+                currentPhotos = photoData.slice(2, 7);
+            } else {
+                currentPhotos = photoData;
+            }
+            renderGrid(currentPhotos);
+        }
+
+        // ===== 目录树展开/收起 =====
+        function toggleTree(el) {
+            const children = el.parentElement.querySelector('.tree-children');
+            const arrow = el.querySelector('.arrow');
+            if (children) {
+                children.classList.toggle('open');
+                if (arrow) arrow.classList.toggle('open');
+            }
+        }
+
+        // ===== 照片详情模态窗 =====
+        function openModal(index) {
+            currentIndex = index;
+            const photo = currentPhotos[index];
+            if (!photo) return;
+
+            document.getElementById('modalFilename').textContent = photo.name;
+            document.getElementById('modalNavInfo').textContent = `${index + 1} / ${currentPhotos.length}`;
+            document.getElementById('modalEmoji').textContent = photo.emoji || '📷';
+            document.getElementById('infoFilename').textContent = photo.name;
+            document.getElementById('infoDate').textContent = photo.date;
+            document.getElementById('infoSize').textContent = photo.size;
+            document.getElementById('infoFileSize').textContent = photo.fileSize;
+            document.getElementById('infoDevice').textContent = photo.device;
+            document.getElementById('infoLocation').textContent = photo.location;
+
+            // 标签
+            const tagsContainer = document.getElementById('infoTags');
+            tagsContainer.innerHTML = '';
+            photo.tags.forEach(tag => {
+                const span = document.createElement('span');
+                span.className = 'tag';
+                span.textContent = tag;
+                tagsContainer.appendChild(span);
+            });
+
+            document.getElementById('photoModal').classList.add('open');
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeModal() {
+            document.getElementById('photoModal').classList.remove('open');
+            document.body.style.overflow = '';
+        }
+
+        function navigatePhoto(direction) {
+            const newIndex = currentIndex + direction;
+            if (newIndex < 0 || newIndex >= currentPhotos.length) return;
+            openModal(newIndex);
+        }
+
+        // ===== 键盘快捷键 =====
+        document.addEventListener('keydown', function(e) {
+            const modal = document.getElementById('photoModal');
+            if (!modal.classList.contains('open')) return;
+            if (e.key === 'Escape') closeModal();
+            if (e.key === 'ArrowLeft') navigatePhoto(-1);
+            if (e.key === 'ArrowRight') navigatePhoto(1);
+        });
+
+        // ===== 点击遮罩关闭 =====
+        document.getElementById('photoModal').addEventListener('click', function(e) {
+            if (e.target === this) closeModal();
+        });
+
+        // ===== 页面切换 =====
+        function switchPage(pageId) {
+            document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+            const target = document.getElementById('page-' + pageId);
+            if (target) target.classList.add('active');
+
+            document.querySelectorAll('.sidebar .nav-item').forEach(item => {
+                item.classList.remove('active');
+                if (item.dataset.page === pageId) item.classList.add('active');
+            });
+
+            // 切换到相册库时重新渲染
+            if (pageId === 'library') {
+                renderGrid(currentPhotos);
+            }
+        }
+
+        // ===== 初始化 =====
+        renderGrid(currentPhotos);
+    </script>
+
+</body>
+</html>

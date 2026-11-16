@@ -1,0 +1,22 @@
+[package]
+name = "akashic"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "akashic"
+path = "src/lib.rs"
+
+[[bin]]
+name = "akashic"
+path = "src/main.rs"
+
+[dependencies]
+dssim = "3.4.0"
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+image = "0.25.10"
+imageflow_core = { path = "../imageflow/imageflow_core" }
+imageflow_helpers = { path = "../imageflow/imageflow_helpers" }
+imageflow_types = { path = "../imageflow/imageflow_types" }
+anyhow = "1.0.104"
