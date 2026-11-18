@@ -10,8 +10,10 @@ use gpui_component::Icon;
 use gpui_component::IconName;
 use gpui_component::WindowExt;
 
+use crate::core::analyze::{AnalyzeProgress, AnalyzeReport};
 use crate::core::config::Paths;
 use crate::core::model::{ScanProgress, ScanStats};
+use crate::ui::analyze::AnalyzeData;
 use crate::ui::library::LibraryData;
 
 // ===== 设计稿配色（akashic-ds.html） =====
@@ -71,6 +73,23 @@ pub struct AppState {
     is_scanning: bool,
     /// 后台扫描进度接收端（Send，可放 Entity）
     progress_rx: Option<Receiver<ScanProgress>>,
+    /// M2 分析结果快照
+    analyze_data: AnalyzeData,
+    /// 后台分析进度接收端
+    analyze_rx: Option<Receiver<AnalyzeProgress>>,
+    is_analyzing: bool,
+    analyze_status: String,
+    /// 整理页当前打开的工具列表（None 表示工具卡片总览）
+    active_tool: Option<OrganizeTool>,
+}
+
+/// 整理页的 4 个分析工具。
+#[derive(Clone, Copy, PartialEq)]
+pub enum OrganizeTool {
+    Similar,
+    Blurry,
+    Screenshot,
+    Large,
 }
 
 impl AppState {
@@ -78,9 +97,12 @@ impl AppState {
         cx.new(|_| {
             // 启动时尝试从已有索引加载；失败则用空快照（不影响 UI 启动）
             let db_path = paths.db_path.clone();
-            let data = match crate::core::db::open(&db_path) {
-                Ok(conn) => LibraryData::reload(&conn).unwrap_or_default(),
-                Err(_) => LibraryData::default(),
+            let (data, analyze_data) = match crate::core::db::open(&db_path) {
+                Ok(conn) => (
+                    LibraryData::reload(&conn).unwrap_or_default(),
+                    AnalyzeData::reload(&conn).unwrap_or_default(),
+                ),
+                Err(_) => (LibraryData::default(), AnalyzeData::default()),
             };
             Self {
                 page: Page::Library,
@@ -92,6 +114,11 @@ impl AppState {
                 scan_status: String::new(),
                 is_scanning: false,
                 progress_rx: None,
+                analyze_data,
+                analyze_rx: None,
+                is_analyzing: false,
+                analyze_status: String::new(),
+                active_tool: None,
             }
         })
     }
@@ -176,11 +203,107 @@ impl AppState {
                                     this.is_scanning = false;
                                     this.progress_rx = None;
                                     done = true;
+                                    // 扫描完成后自动触发 M2 分析
+                                    this.start_analysis(cx);
                                 }
                                 ScanProgress::Failed { message } => {
                                     this.scan_status = format!("扫描失败：{message}");
                                     this.is_scanning = false;
                                     this.progress_rx = None;
+                                    done = true;
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    if done {
+                        break;
+                    }
+                }
+            }
+        }).detach();
+    }
+
+    /// 启动后台分析：遍历索引计算模糊/截图/相似组，写库并回传进度。
+    /// 扫描完成后会自动调用；也可在整理页手动重新分析。
+    pub fn start_analysis(&mut self, cx: &mut Context<Self>) {
+        if self.is_analyzing {
+            return;
+        }
+        self.is_analyzing = true;
+        self.analyze_status = "正在分析照片 …".to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel::<AnalyzeProgress>();
+        self.analyze_rx = Some(rx);
+        let paths = self.paths.clone();
+
+        // 后台线程：自己打开 DB 连接运行分析（Connection 不 Send）。
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<AnalyzeReport> {
+                let conn = crate::core::db::open(&paths.db_path)?;
+                crate::core::analyze::analyze_library(&conn, Some(&tx))
+            })();
+            if let Err(e) = result {
+                let _ = tx.send(AnalyzeProgress::Failed { message: e.to_string() });
+            }
+        });
+
+        // UI 侧：与扫描一致的定时轮询。
+        cx.spawn(async move |entity, app: &mut AsyncApp| {
+            loop {
+                gpui::background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+
+                let got = entity
+                    .update(app, |this: &mut Self, _cx| {
+                        if let Some(rx) = &this.analyze_rx {
+                            match rx.try_recv() {
+                                Ok(p) => Some(p),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    Some(AnalyzeProgress::Failed {
+                                        message: "分析线程意外退出".to_string(),
+                                    })
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .ok()
+                    .flatten();
+
+                if let Some(p) = got {
+                    let mut done = false;
+                    entity
+                        .update(app, |this: &mut Self, cx| {
+                            match p {
+                                AnalyzeProgress::Started { total } => {
+                                    this.analyze_status = format!("正在分析 … 共 {total} 张");
+                                }
+                                AnalyzeProgress::Analyzing { processed, total } => {
+                                    this.analyze_status =
+                                        format!("正在分析 … {processed}/{total} 张");
+                                }
+                                AnalyzeProgress::Finished { report } => {
+                                    if let Ok(conn) = crate::core::db::open(&this.paths.db_path) {
+                                        this.analyze_data =
+                                            AnalyzeData::reload(&conn).unwrap_or_default();
+                                    }
+                                    this.analyze_status = format!(
+                                        "分析完成：模糊 {} 张，截图 {} 张，相似组 {} 组，耗时 {} ms",
+                                        report.blurry_count, report.screenshot_count,
+                                        report.similar_groups, report.duration_ms
+                                    );
+                                    this.is_analyzing = false;
+                                    this.analyze_rx = None;
+                                    done = true;
+                                }
+                                AnalyzeProgress::Failed { message } => {
+                                    this.analyze_status = format!("分析失败：{message}");
+                                    this.is_analyzing = false;
+                                    this.analyze_rx = None;
                                     done = true;
                                 }
                             }
@@ -428,7 +551,7 @@ impl AppRoot {
     fn render_page(&self, state: &AppState) -> impl IntoElement + 'static {
         match state.page {
             Page::Home => self.page_home(state).into_any_element(),
-            Page::Organize => self.page_organize().into_any_element(),
+            Page::Organize => self.page_organize(state).into_any_element(),
             Page::Library => self.page_library(state).into_any_element(),
             Page::Rename => self
                 .page_placeholder(IconName::CaseSensitive, "重命名功能 — 从相册库选择照片后使用")
@@ -580,16 +703,20 @@ impl AppRoot {
     }
 
     // ===== 智能整理页 =====
-    fn page_organize(&self) -> impl IntoElement + 'static {
+    fn page_organize(&self, state: &AppState) -> impl IntoElement + 'static {
+        let app = &self.app;
+        let badges = state.analyze_data.badges();
+        // 前 4 个为 M2 已实现的分析工具，可点击进入结果列表；后 2 个属后续里程碑。
         let tools = vec![
-            (IconName::Copy, "相似照片", "连拍 & 重复角度", "12组", false),
-            (IconName::EyeOff, "模糊检测", "手抖 / 失焦", "43张", false),
-            (IconName::Frame, "截图筛选", "屏幕录制 · 截屏", "218张", false),
-            (IconName::File, "大文件", "按大小排序", "34个", false),
-            (IconName::CaseSensitive, "智能重命名", "统一命名风格", "⭐", true),
-            (IconName::FolderOpen, "智能归档", "自动归入目录", "⭐", true),
+            (IconName::Copy, "相似照片", "连拍 & 重复角度", badges[0].clone(), false, Some(OrganizeTool::Similar)),
+            (IconName::EyeOff, "模糊检测", "手抖 / 失焦", badges[1].clone(), false, Some(OrganizeTool::Blurry)),
+            (IconName::Frame, "截图筛选", "屏幕录制 · 截屏", badges[2].clone(), false, Some(OrganizeTool::Screenshot)),
+            (IconName::File, "大文件", "按大小排序", badges[3].clone(), false, Some(OrganizeTool::Large)),
+            (IconName::CaseSensitive, "智能重命名", "统一命名风格", "M3".to_string(), true, None),
+            (IconName::FolderOpen, "智能归档", "自动归入目录", "M4".to_string(), true, None),
         ];
-        let tool_cards = tools.into_iter().enumerate().map(|(ti, (icon, name, desc, badge, star))| {
+        let tool_cards = tools.into_iter().enumerate().map(|(ti, (icon, name, desc, badge, star, tool))| {
+            let app = app.clone();
             div()
                 .id(("tool", ti))
                 .flex_1()
@@ -602,6 +729,14 @@ impl AppRoot {
                 .flex().flex_row()
                 .items_center()
                 .gap(px(14.))
+                .on_click(move |_ev, _w, cx| {
+                    if let Some(t) = tool {
+                        app.update(cx, |s, cx| {
+                            s.active_tool = Some(t);
+                            cx.notify();
+                        });
+                    }
+                })
                 .child(Icon::new(icon).size(px(24.)).text_color(col(PRIMARY_LIGHTER)))
                 .child(
                     div()
@@ -665,23 +800,75 @@ impl AppRoot {
                 .child(div().text_size(px(11.)).mt(px(2.)).text_color(col(TEXT_LIGHT)).child(count.to_owned()))
         });
 
+        // 顶部状态：优先显示分析进度，其次扫描进度。
+        let status = if state.is_analyzing || !state.analyze_status.is_empty() {
+            state.analyze_status.clone()
+        } else {
+            state.scan_status.clone()
+        };
+        let app_analyze = app.clone();
+        let header = div()
+            .id("organize-header")
+            .flex().flex_row()
+            .justify_between()
+            .items_center()
+            .mb(px(12.))
+            .child(page_title("🔍 智能整理", "选择工具开始清理"))
+            .child(
+                Button::new("organize-analyze")
+                    .outline()
+                    .icon(IconName::Redo)
+                    .label("重新分析")
+                    .on_click(move |_ev, _w, cx| {
+                        app_analyze.update(cx, |s, cx| {
+                            s.start_analysis(cx);
+                            cx.notify();
+                        });
+                    }),
+            );
+
+        // 选中工具时展示结果列表，否则展示工具卡片总览。
+        if let Some(tool) = state.active_tool {
+            let app_back = app.clone();
+            return div()
+                .id("page-organize")
+                .flex().flex_col()
+                .child(header)
+                .child(
+                    div()
+                        .id("analyze-status")
+                        .text_size(px(12.))
+                        .text_color(col(TEXT_SECONDARY))
+                        .mb(px(10.))
+                        .child(status),
+                )
+                .child(
+                    Button::new("organize-back")
+                        .ghost()
+                        .icon(IconName::ArrowLeft)
+                        .label("返回工具列表")
+                        .on_click(move |_ev, _w, cx| {
+                            app_back.update(cx, |s, cx| {
+                                s.active_tool = None;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .child(self.render_tool_result(tool, state))
+                .into_any_element();
+        }
+
         div()
             .id("page-organize")
             .flex().flex_col()
+            .child(header)
             .child(
                 div()
-                    .id("organize-header")
-                    .flex().flex_row()
-                    .justify_between()
-                    .items_center()
-                    .mb(px(16.))
-                    .child(page_title("🔍 智能整理", "选择工具开始清理"))
-                    .child(
-                        Button::new("organize-rescan")
-                            .outline()
-                            .icon(IconName::Redo)
-                            .label("重新扫描"),
-                    ),
+                    .id("analyze-status")
+                    .text_size(px(12.))
+                    .text_color(col(TEXT_SECONDARY))
+                    .mb(px(10.))
+                    .child(status),
             )
             .child(
                 div()
@@ -718,6 +905,124 @@ impl AppRoot {
                             .overflow_x_scroll()
                             .children(story_cards.collect::<Vec<_>>()),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// 渲染某个分析工具的结果列表（相似组按组展示，其余按照片展示）。
+    fn render_tool_result(&self, tool: OrganizeTool, state: &AppState) -> impl IntoElement + 'static {
+        let d = &state.analyze_data;
+        if !d.is_ready() {
+            return div()
+                .id("analyze-empty")
+                .flex_1()
+                .flex().flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .child(Icon::new(IconName::EyeOff).size(px(40.)).text_color(col(TEXT_LIGHT)))
+                .child(div().text_size(px(14.)).text_color(col(TEXT_SECONDARY))
+                    .child("尚无分析结果，请先扫描目录（扫描完成后会自动分析）"))
+                .into_any_element();
+        }
+
+        match tool {
+            OrganizeTool::Similar => self.render_similar_groups(state).into_any_element(),
+            OrganizeTool::Blurry => self.render_photo_list(&d.blurry, "模糊照片", "按模糊程度排序").into_any_element(),
+            OrganizeTool::Screenshot => self.render_photo_list(&d.screenshots, "截图", "按拍摄时间排序").into_any_element(),
+            OrganizeTool::Large => self.render_photo_list(&d.large, "大文件", "按文件大小排序").into_any_element(),
+        }
+    }
+
+    /// 通用照片结果列表（模糊/截图/大文件）。
+    fn render_photo_list(&self, photos: &[crate::core::model::Photo], title: &str, sub: &str) -> impl IntoElement + 'static {
+        let tiles: Vec<_> = photos.iter().enumerate().map(|(i, p)| {
+            let hue = stable_hue(&p.path.to_string_lossy());
+            div()
+                .id(("resultitem", i))
+                .w(px(180.))
+                .bg(col(BG_WHITE))
+                .rounded_lg()
+                .overflow_hidden()
+                .shadow_sm()
+                .child(
+                    div()
+                        .id(("resultthumb", i))
+                        .h(px(110.))
+                        .w_full()
+                        .bg(photo_block_bg(hue))
+                        .flex().flex_col()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::Frame).size(px(28.)).text_color(rgba(255,255,255,0.9))),
+                )
+                .child(
+                    div()
+                        .id(("resultinfo", i))
+                        .px(px(10.))
+                        .py(px(8.))
+                        .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD)
+                            .child(p.file_name.clone()))
+                        .child(div().text_size(px(10.)).mt(px(2.)).text_color(col(TEXT_SECONDARY))
+                            .child(format!("{} · {}", p.file_size_label(), p.date_label())))
+                        .when(p.blur_score.is_some(), |d| d.child(
+                            div().text_size(px(10.)).mt(px(2.)).text_color(col(TEXT_LIGHT))
+                                .child(format!("模糊分 {:.0}", p.blur_score.unwrap())))),
+                )
+        }).collect();
+
+        div()
+            .id("photo-result")
+            .flex_1()
+            .flex().flex_col()
+            .child(page_title(title.to_string(), sub.to_string()))
+            .child(div().text_size(px(12.)).text_color(col(TEXT_SECONDARY)).mb(px(10.))
+                .child(format!("共 {} 张", photos.len())))
+            .child(
+                div()
+                    .id("photo-result-grid")
+                    .flex().flex_row().flex_wrap()
+                    .gap(px(12.))
+                    .children(tiles),
+            )
+    }
+
+    /// 相似组结果：每组一张代表卡片，显示成员数。
+    fn render_similar_groups(&self, state: &AppState) -> impl IntoElement + 'static {
+        let groups = &state.analyze_data.groups;
+        let cards: Vec<_> = groups.iter().enumerate().map(|(gi, g)| {
+            let rep = g.members.first();
+            let name = rep.map(|p| p.file_name.clone()).unwrap_or_default();
+            let hue = rep.map(|p| stable_hue(&p.path.to_string_lossy())).unwrap_or(0.0);
+            div()
+                .id(("group", gi))
+                .w(px(220.))
+                .bg(col(BG_WHITE))
+                .rounded_lg()
+                .overflow_hidden()
+                .shadow_sm()
+                .child(
+                    div().id(("groupthumb", gi)).h(px(120.)).w_full().bg(photo_block_bg(hue))
+                        .flex().flex_col().items_center().justify_center()
+                        .child(Icon::new(IconName::Copy).size(px(30.)).text_color(rgba(255,255,255,0.9))),
+                )
+                .child(
+                    div().id(("groupinfo", gi)).px(px(12.)).py(px(10.))
+                        .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("{} 张相似", g.members.len())))
+                        .child(div().text_size(px(10.)).mt(px(2.)).text_color(col(TEXT_SECONDARY))
+                            .child(name)),
+                )
+        }).collect();
+
+        div()
+            .id("similar-result")
+            .flex_1()
+            .flex().flex_col()
+            .child(page_title("相似照片".to_string(), format!("{} 组", groups.len())))
+            .child(
+                div().id("similar-grid").flex().flex_row().flex_wrap().gap(px(12.))
+                    .children(cards),
             )
     }
 

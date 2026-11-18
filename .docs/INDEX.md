@@ -7,9 +7,10 @@
 > 更新日期：2026-11-16 16:15 +0800（新增开发计划入口）。
 > 更新日期：2026-11-16 17:35 +0800（M0 分层：src 拆为 core/ 与 ui/；新增 core-model 模块 md；imageflow 改 submodule）。
 > 更新日期：2026-11-18 15:10 +0800（M1 真实索引：新增 core-scanner 模块 md；相册库/首页接真实数据；新增 M1 依赖）。
+> 更新日期：2026-11-18 15:40 +0800（M2 分析与智能整理：新增 core-analyze 模块 md 与 ui/analyze.rs、tests/analyze_test.rs；整理页接真实分析结果与后台分析调度）。
 
 ## 项目概述
-Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引：原生目录选择、后台递归扫描、EXIF 元数据、内容哈希、SQLite 索引、缩略图缓存、目录过滤与搜索；相册库/首页显示真实数据。相似归组、模糊检测等整理算法与批量操作属后续里程碑，页面仍为占位。
+Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引（目录选择/后台扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索）。M2 已实现分析与智能整理：模糊评分（Laplacian 方差）、截图启发式、大文件排序、相似归组（pHash + dssim + 并查集），扫描后自动后台分析，整理页 4 个工具卡片接入真实结果列表。批量删除/回收站/重命名/归档属后续里程碑，页面仍为占位。
 
 ## 目录职责表
 
@@ -18,10 +19,13 @@ Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私�
 | `src/main.rs` | 组合根：Application/Assets/GPUI 初始化、本地目录初始化、打开窗口 | [ui-desktop](modules/ui-desktop.md) |
 | `src/lib.rs` | 库入口：`pub mod core; pub mod ui;` | [build-config](modules/build-config.md) |
 | `src/core/model.rs` / `config.rs` | 真实数据模型（Photo/Folder/ScanStats）与本地路径配置 | [core-model](modules/core-model.md) |
-| `src/core/db.rs` / `scanner.rs` / `thumbnail.rs` | SQLite 索引、递归扫描+EXIF+哈希、缩略图缓存 | [core-scanner](modules/core-scanner.md) |
-| `src/ui/app.rs` / `assets.rs` | gpui 渲染：全局状态、页面分发、目录树、照片弹窗、图标资源 | [ui-desktop](modules/ui-desktop.md) |
+| `src/core/db.rs` / `scanner.rs` / `thumbnail.rs` | SQLite 索引、递归扫描+EXIF+哈希、缩略图缓存、分析结果读写 | [core-scanner](modules/core-scanner.md) |
+| `src/core/analyze/*.rs` | 模糊评分、截图识别、大文件排序、相似归组（pHash+dssim+并查集） | [core-analyze](modules/core-analyze.md) |
+| `src/ui/app.rs` / `assets.rs` | gpui 渲染：全局状态、页面分发、目录树、照片弹窗、整理页结果列表、图标资源 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/library.rs` | UI 数据适配层：索引数据 → 相册库视图模型 | [ui-desktop](modules/ui-desktop.md) |
+| `src/ui/analyze.rs` | UI 分析适配层：分析结果 → 整理页视图模型 | [ui-desktop](modules/ui-desktop.md) |
 | `tests/scanner_test.rs` | 扫描/增量/缩略图集成测试（临时目录，不碰真实相册） | [core-scanner](modules/core-scanner.md) |
+| `tests/analyze_test.rs` | 分析链路集成测试（清晰/模糊/重复/截图样本） | [core-analyze](modules/core-analyze.md) |
 | `vendor/imageflow/` | imageflow git submodule（固定 commit `7cbe26be`），图像编解码 | [build-config](modules/build-config.md) |
 | `.gitmodules` | submodule 配置：vendor/imageflow → GitHub 地址 | [build-config](modules/build-config.md) |
 | `akashic-ds.html` | 单文件 HTML 交互设计稿，5 个页面 + 照片详情弹窗 | [design-prototype](modules/design-prototype.md) |
@@ -49,16 +53,17 @@ product-spec（PRD / 视觉规范）
                     v
               ui-desktop（src/ui/，gpui 渲染）───> icon-assets（SVG 图标）
                     │ 依赖（单向）              ───> rfd（目录对话框）
-                    v
-              core-model（数据模型 + 路径配置）
-                    ^
-                    │ 使用
-              core-scanner（SQLite 索引 + 扫描 + 缩略图）
+                    ├──> core-model（数据模型 + 路径配置）
+                    ├──> core-scanner（SQLite 索引 + 扫描 + 缩略图）
+                    └──> core-analyze（M2 分析与智能整理）
+                                │ 依赖
+                                v
+                          core-scanner（db 读写分析结果）
                     │
                     v
               build-config（Cargo.toml / Cargo.lock / .gitmodules）
                     │
-                    ├─> rusqlite(bundled) / kamadak-exif / walkdir / image / twox-hash / chrono（crates.io）
+                    ├─> rusqlite(bundled) / kamadak-exif / walkdir / image / twox-hash / chrono / dssim（crates.io）
                     └─> vendor/imageflow（git submodule，固定 7cbe26be，c-codecs）
 
 约束：main → ui → core → 外部设施，core 不得引用 gpui。
@@ -72,7 +77,9 @@ ai-workflow ──> 约束所有 Agent 对以上模块的读取与文档更新
 - 程序入口：`src/main.rs::main()` → `Paths::platform_default/ensure_dirs` → `ui::app::new_app_state`（加载索引）→ `AppRoot::new` → `Root::new`。
 - 页面分发：`src/ui/app.rs::AppRoot::render_page`（Page::Home / Organize / Library / Rename / Trash）。
 - 扫描入口：`AppState::start_scan` → 后台 `core::scanner::scan_root` → `core::db` 写库 → channel 回传进度 → `LibraryData::reload`。
+- 分析入口：扫描完成后自动 `AppState::start_analysis`（或整理页「重新分析」）→ 后台 `core::analyze::analyze_library` → `core::db` 写回分析结果 → `AnalyzeProgress` 回传 → `AnalyzeData::reload`。
 - 真实数据：`src/core/db.rs`（Repository）、`src/core/scanner.rs`（扫描）、`src/ui/library.rs`（视图适配）；模型在 `core/model.rs`，路径在 `core/config.rs`。
+- 分析算法：`src/core/analyze/`（blur / classify / similarity / pipeline）；测试 `tests/analyze_test.rs`。
 - 设计稿入口：`akashic-ds.html` 的 `#page-library`（默认 active）与 `switchPage(pageId)`。
 - 构建验证：`cargo check --manifest-path D:/Code/Freespace/akashic/Cargo.toml`（2026-11-16 通过，exit 0）。
 
@@ -80,9 +87,10 @@ ai-workflow ──> 约束所有 Agent 对以上模块的读取与文档更新
 
 | 模块 | 覆盖 hash | 状态 | 可信度 |
 | --- | --- | --- | --- |
-| ui-desktop | a777486cc90b | valid | AI 生成未审 |
-| core-model | 26c49c6040ee | valid | AI 生成未审 |
-| core-scanner | 808d37dcd3f9 | valid | AI 生成未审 |
+| ui-desktop | 379e4b66b661 | valid | AI 生成未审 |
+| core-model | d4a4d0c6ed02 | valid | AI 生成未审 |
+| core-scanner | 50186e77ef05 | valid | AI 生成未审 |
+| core-analyze | f49408cd46d5 | valid | AI 生成未审 |
 | design-prototype | d32b2f6af661 | valid | AI 生成未审 |
 | product-spec | 2df241d5d3bf | valid | AI 生成未审 |
 | build-config | 532872a43d8b | valid | AI 生成未审 |

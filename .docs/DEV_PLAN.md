@@ -1,10 +1,11 @@
 # Akashic 开发计划
 
-> 编制时间：2026-11-16 16:15 +0800
-> 更新时间：2026-11-16 16:32 +0800（确认个人使用 / imageflow 子模块 / 无 HEIC，新增照片足迹）
-> 更新时间：2026-11-16 16:44 +0800（照片足迹相关功能本期暂缓，保留规划不实施；开始 M0 工程地基）
+> 编制时间：2026-11-16 16:15 +0800  
+> 更新时间：2026-11-16 16:32 +0800（确认个人使用 / imageflow 子模块 / 无 HEIC，新增照片足迹）  
+> 更新时间：2026-11-16 16:44 +0800（照片足迹相关功能本期暂缓，保留规划不实施；开始 M0 工程地基）  
 > 更新时间：2026-11-18 15:10 +0800（M0 完成；M1 真实索引完成：目录选择/递归扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索，相册库与首页接真实数据）
-> 文档性质：规划文档，非 `.docs/modules/` 下的派生缓存；不参与覆盖 hash 校验。
+> 更新时间：2026-11-18 15:40 +0800（M2 完成：模糊评分/截图识别/大文件排序/相似归组，后台分析调度，整理页 4 工具接真实结果列表）  
+> 文档性质：规划文档，非 `.docs/modules/` 下的派生缓存；不参与覆盖 hash 校验。  
 > 依据：`design.md`（PRD v1）与 2026-11-16 的源码现状（见 `.docs/INDEX.md`）。
 
 ## 1. 目标与边界
@@ -27,14 +28,14 @@
 
 ## 2. 现状差距
 
-| 领域 | 当前状态 | 目标状态 |
-| --- | --- | --- |
-| UI 外壳 | 标题栏/侧栏/5 页面/相册库网格/照片详情弹窗已可运行 | 保留视觉，替换为真实数据与真实操作 |
-| 数据 | `PHOTOS`、`folder_defs()`、首页统计全部硬编码 | 本地索引数据库 + 文件系统真实元数据 |
-| 扫描 | 无目录选择、无遍历、无增量更新 | 目录选择、递归扫描、增量索引、缩略图缓存 |
-| 算法 | `dssim`/`image`/`imageflow_*` 仅声明未调用 | 相似归组、模糊评分、截图/大文件筛选 |
-| 操作 | 工具卡片、详情弹窗按钮、重命名/回收站页均为占位 | 删除/恢复/撤销、模板重命名、规则归档 |
-| 工程 | Git 无提交；`src/lib.rs` 是模板 `add()`；代码集中在 `main.rs` | 首次提交；核心/UI 分层；可测试、可维护 |
+| 领域    | 当前状态                                             | 目标状态                  |
+| ----- | ------------------------------------------------ | --------------------- |
+| UI 外壳 | 标题栏/侧栏/5 页面/相册库网格/照片详情弹窗已可运行                     | 保留视觉，替换为真实数据与真实操作     |
+| 数据    | `PHOTOS`、`folder_defs()`、首页统计全部硬编码               | 本地索引数据库 + 文件系统真实元数据   |
+| 扫描    | 无目录选择、无遍历、无增量更新                                  | 目录选择、递归扫描、增量索引、缩略图缓存  |
+| 算法    | `dssim`/`image`/`imageflow_*` 仅声明未调用             | 相似归组、模糊评分、截图/大文件筛选    |
+| 操作    | 工具卡片、详情弹窗按钮、重命名/回收站页均为占位                         | 删除/恢复/撤销、模板重命名、规则归档   |
+| 工程    | Git 无提交；`src/lib.rs` 是模板 `add()`；代码集中在 `main.rs` | 首次提交；核心/UI 分层；可测试、可维护 |
 
 ## 3. 目标架构
 
@@ -75,29 +76,29 @@ tests/
 
 已核对本地 `../imageflow` 仓库（HEAD `7cbe26be`）与 GitHub README。`imageflow_core` 是执行引擎（解码、约束/重采样、裁剪、旋转、EXIF 方向、色彩处理、编码），`imageflow_types` 定义作业图的 `Node` / `Execute001` / `EncoderPreset`，`imageflow_helpers` 是内部工具集。README 明确说明其 Rust API **不稳定、不与 C ABI 版本 semver 对齐**；仓库默认 `c-codecs` 依赖 NASM/Visual Studio Build Tools，`zen-codecs` 是纯 Rust 编解码路径。许可证为 AGPLv3，商业分发需评估授权或购买例外。
 
-| 依赖 | 状态 | 在项目中的作用 | 关键约束 |
-| --- | --- | --- | --- |
-| `gpui = 0.2.2` | 保留 | 桌面窗口、事件循环、Element 渲染 | 版本较旧，UI 代码集中在 `ui/`，避免扩散 |
-| `gpui-component = 0.5.1` | 保留 | `Root`、`Button`、`Dialog`、`Icon` 等现成组件 | 与 gpui 版本强耦合，升级需整体回归 |
-| `anyhow` | 保留 | 应用统一错误边界，把 imageflow/SQLite/IO 错误转成用户可读信息 | 核心库对外返回 `anyhow::Result` |
-| `imageflow_core` | 保留但改配置 | 缩略图流水线：解码 → 应用 EXIF 方向 → 约束/缩放 → 编码到缓存；也负责格式转换 | 使用 `default-features = false, features = ["zen-codecs"]`，避开 C 工具链；固定本地 commit |
-| `imageflow_types` | 保留 | 构造作业图：`Node::Decode`、`Node::ApplyOrientation`、`Node::Constrain` / `Resample2D`、`Node::Encode`、`Execute001` | 必须显式依赖，不能只靠 `imageflow_core` 的传递依赖 |
-| `imageflow_helpers` | 移除直接依赖 | 不再直接用；其 hashing/filesystem 工具属于 imageflow 内部实现 | 保留在 imageflow_core 的传递依赖中即可，避免绑定不稳定 API |
-| `image = 0.25.10` | 保留 | 像素级分析：灰度化、缩放、Laplacian 模糊评分、给 dssim 提供缓冲区 | 不再作为主缩略图流水线；避免与 imageflow 重复解码 |
-| `dssim = 3.4.0` | 保留 | 相似照片精排；先用 pHash 粗筛缩小候选集 | 输入用缩略图而非原图 |
-| `kamadak-exif`（或 `exif`） | 新增 | 读取拍摄时间、设备、GPS、Orientation 标签 | 与 imageflow 的 `ApplyOrientation` 配合，方向只应用一次 |
-| `rusqlite`（`bundled`） | 新增 | 本地照片索引、分组结果、操作日志、设置 | 单文件本地库，事务保证批量操作可撤销 |
-| `serde` / `serde_json` | 新增 | 配置、重命名模板、操作记录、imageflow 作业参数序列化 | imageflow 类型本身已用 serde，版本需兼容 |
-| `walkdir` | 新增 | 递归扫描目录，配合增量索引 | 过滤隐藏目录与回收站目录 |
-| `rfd` | 新增 | 原生文件夹选择对话框 | 仅在用户主动触发时调用 |
-| `xxhash_rust` | 新增 | 快速内容哈希，作为缩略图缓存 key 与重复检测辅助 | 与文件大小、尺寸联合判断，避免单独依赖哈希 |
-| `tracing` + `tracing-appender` | 新增 | 扫描/分类/批量操作日志，可导出诊断 | 默认写应用数据目录，不写照片目录 |
-| `dirs`（或 `directories`） | 新增 | 定位应用数据目录、缓存目录、回收站目录 | 不同平台路径统一由 core 提供 |
-| `tempfile` | 新增（dev） | 测试中为扫描/删除/重命名/归档提供临时目录 | 禁止用真实相册做破坏性测试 |
-| `rayon` | 按需新增 | 批量分析与缩略图生成并行化 | imageflow 的 `zen-codecs` 已带 rayon，先复用再决定是否直依赖 |
-| `oxigeo` | **暂缓**（原按需） | 照片足迹数据的 GeoJSON 导入/导出、EPSG CRS 变换、可选空间聚类 | 本期不引入；未来重启足迹功能时再评估，只开需要的 feature：`default-features = false, features = ["geojson"]`（需要投影时再加 `proj`）；MSRV 1.95，当前工具链 1.98 满足 |
-| GCJ-02 转换 | **暂缓**（原自实现或小 crate） | EXIF 的 WGS84 坐标转为国内地图要求的 GCJ-02 | 本期不实现；未来重启时只做坐标偏移，不用带 OSM 边界 mask 的库做领土判断；个人本地数据仅本地保存 |
-| 腾讯位置服务 GL JS | **暂缓**（原运行时依赖） | 渲染照片足迹地图与标记 | 本期不引入；未来重启时独立桌面应用需自行申请 key，代码中只写占位符，禁止内置可用 key |
+| 依赖                             | 状态                   | 在项目中的作用                                                                                                    | 关键约束                                                                                                                        |
+| ------------------------------ | -------------------- | ---------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `gpui = 0.2.2`                 | 保留                   | 桌面窗口、事件循环、Element 渲染                                                                                       | 版本较旧，UI 代码集中在 `ui/`，避免扩散                                                                                                    |
+| `gpui-component = 0.5.1`       | 保留                   | `Root`、`Button`、`Dialog`、`Icon` 等现成组件                                                                      | 与 gpui 版本强耦合，升级需整体回归                                                                                                        |
+| `anyhow`                       | 保留                   | 应用统一错误边界，把 imageflow/SQLite/IO 错误转成用户可读信息                                                                  | 核心库对外返回 `anyhow::Result`                                                                                                    |
+| `imageflow_core`               | 保留但改配置               | 缩略图流水线：解码 → 应用 EXIF 方向 → 约束/缩放 → 编码到缓存；也负责格式转换                                                             | 使用 `default-features = false, features = ["zen-codecs"]`，避开 C 工具链；固定本地 commit                                               |
+| `imageflow_types`              | 保留                   | 构造作业图：`Node::Decode`、`Node::ApplyOrientation`、`Node::Constrain` / `Resample2D`、`Node::Encode`、`Execute001` | 必须显式依赖，不能只靠 `imageflow_core` 的传递依赖                                                                                          |
+| `imageflow_helpers`            | 移除直接依赖               | 不再直接用；其 hashing/filesystem 工具属于 imageflow 内部实现                                                             | 保留在 imageflow_core 的传递依赖中即可，避免绑定不稳定 API                                                                                     |
+| `image = 0.25.10`              | 保留                   | 像素级分析：灰度化、缩放、Laplacian 模糊评分、给 dssim 提供缓冲区                                                                  | 不再作为主缩略图流水线；避免与 imageflow 重复解码                                                                                              |
+| `dssim = 3.4.0`                | 保留                   | 相似照片精排；先用 pHash 粗筛缩小候选集                                                                                    | 输入用缩略图而非原图                                                                                                                  |
+| `kamadak-exif`（或 `exif`）       | 新增                   | 读取拍摄时间、设备、GPS、Orientation 标签                                                                               | 与 imageflow 的 `ApplyOrientation` 配合，方向只应用一次                                                                                 |
+| `rusqlite`（`bundled`）          | 新增                   | 本地照片索引、分组结果、操作日志、设置                                                                                        | 单文件本地库，事务保证批量操作可撤销                                                                                                          |
+| `serde` / `serde_json`         | 新增                   | 配置、重命名模板、操作记录、imageflow 作业参数序列化                                                                            | imageflow 类型本身已用 serde，版本需兼容                                                                                                |
+| `walkdir`                      | 新增                   | 递归扫描目录，配合增量索引                                                                                              | 过滤隐藏目录与回收站目录                                                                                                                |
+| `rfd`                          | 新增                   | 原生文件夹选择对话框                                                                                                 | 仅在用户主动触发时调用                                                                                                                 |
+| `xxhash_rust`                  | 新增                   | 快速内容哈希，作为缩略图缓存 key 与重复检测辅助                                                                                 | 与文件大小、尺寸联合判断，避免单独依赖哈希                                                                                                       |
+| `tracing` + `tracing-appender` | 新增                   | 扫描/分类/批量操作日志，可导出诊断                                                                                         | 默认写应用数据目录，不写照片目录                                                                                                            |
+| `dirs`（或 `directories`）        | 新增                   | 定位应用数据目录、缓存目录、回收站目录                                                                                        | 不同平台路径统一由 core 提供                                                                                                           |
+| `tempfile`                     | 新增（dev）              | 测试中为扫描/删除/重命名/归档提供临时目录                                                                                     | 禁止用真实相册做破坏性测试                                                                                                               |
+| `rayon`                        | 按需新增                 | 批量分析与缩略图生成并行化                                                                                              | imageflow 的 `zen-codecs` 已带 rayon，先复用再决定是否直依赖                                                                               |
+| `oxigeo`                       | **暂缓**（原按需）          | 照片足迹数据的 GeoJSON 导入/导出、EPSG CRS 变换、可选空间聚类                                                                   | 本期不引入；未来重启足迹功能时再评估，只开需要的 feature：`default-features = false, features = ["geojson"]`（需要投影时再加 `proj`）；MSRV 1.95，当前工具链 1.98 满足 |
+| GCJ-02 转换                      | **暂缓**（原自实现或小 crate） | EXIF 的 WGS84 坐标转为国内地图要求的 GCJ-02                                                                            | 本期不实现；未来重启时只做坐标偏移，不用带 OSM 边界 mask 的库做领土判断；个人本地数据仅本地保存                                                                       |
+| 腾讯位置服务 GL JS                   | **暂缓**（原运行时依赖）       | 渲染照片足迹地图与标记                                                                                                | 本期不引入；未来重启时独立桌面应用需自行申请 key，代码中只写占位符，禁止内置可用 key                                                                              |
 
 明确不做：`imageflow_abi` / `imageflow_tool` / `imageflow_server`（直接调用 Rust API）、OCR、云同步、HEIC/HEIF 解码、Google/Apple/Bing/Mapbox/OSM 瓦片与第三方未资质地图源。
 
@@ -113,7 +114,7 @@ OxiGeo 可行性结论：**可以做，但不是照片足迹的核心依赖**。
 
 `Photo`：id、path、file_name、size_bytes、exif_date、modified_at、width、height、device、location、gps_lon_wgs84、gps_lat_wgs84、gps_lon_gcj02、gps_lat_gcj02、gps_source、tags、content_hash、blur_score、is_screenshot、group_id、favorite、trash_state、archived_path。
 
-> 其中 6 个 gps_* 字段与地图展示相关，本期暂缓阶段 schema 可预留列但不采集、不转换、不展示，避免为暂缓功能付出实现成本。
+> 其中 6 个 gps\_* 字段与地图展示相关，本期暂缓阶段 schema 可预留列但不采集、不转换、不展示，避免为暂缓功能付出实现成本。
 
 `Folder`：id、parent_id、path、label、photo_count，由索引路径派生，不再手写 `folder_defs()`。
 
@@ -139,11 +140,13 @@ OxiGeo 可行性结论：**可以做，但不是照片足迹的核心依赖**。
 
 > **实际交付（2026-11-18）**：目录选择（rfd）、walkdir 扫描、EXIF（时间/设备）、twox-hash 内容哈希、`image` 缩略图缓存（400px）、SQLite schema + Repository、增量 upsert 与 sweep 清理、目录树派生与点击过滤、关键词搜索均已实现；相册库与首页统计改为真实数据。8 个测试通过（含临时目录扫描集成测试）。**偏差与遗留**：① `rusqlite bundled` 依赖已验证可编译，crates.io 可访问（GitHub git 依赖仍不通，zen-codecs 未切换）；② 缩略图 UI 仍用色块占位，`thumbnail_for` 已返回缓存路径，接 gpui `img()` 即可显示真图；③ 排序 UI 未做（Repository 已按时间倒序）；④ 5000 张性能基线未实测；⑤ M0 模拟数据常量待清理。已同步 ui-desktop/core-model/core-scanner/build-config 模块 md 与 INDEX。
 
-### M2 · 分析与智能整理
+### M2 · 分析与智能整理 — 已完成（2026-11-18）
 
 任务：实现相似归组、模糊评分、截图识别、大文件筛选；结果落库；后台任务带进度；`page_organize` 的 6 个工具卡片分别进入真实列表页；组内预览与“保留最佳”交互。
 
 验收：fixture 测试能稳定识别模糊/重复/截图样本；工具卡片、列表页、预览页形成闭环；ui-desktop 模块文档的工具卡片风险项被消除。
+
+> **实际交付（2026-11-18）**：新增 `core/analyze/`（blur Laplacian 方差评分、classify 截图启发式+大文件排序、similarity pHash+DSSIM+并查集、pipeline 编排与进度）；db 增 `photo_groups` 表与 4 个分析列（含老库迁移）；扫描完成自动触发后台分析或整理页手动重分析；整理页前 4 工具卡片 badge 改真实值并可点击进入相似组/模糊/截图/大文件结果列表。24 个测试通过（20 lib + 2 analyze 集成 + 2 scanner 集成）。新增 `core-analyze` 模块 md 与 `ui/analyze.rs` 适配层，刷新 core-model/core-scanner/ui-desktop/INDEX。**偏差与遗留**：① 结果列表缩略图仍用色块占位（缓存路径已就绪，待 M5 接 `img()`）；② 后 2 个工具（重命名/归档）徽标标为 M3/M4，未进入列表页（属对应里程碑）；③ “保留最佳”/删除交互属 M3 回收站范围，本阶段仅展示结果列表；④ dssim 精排为尽力而为（坏图回退纯 pHash）；⑤ 5000 张分析性能未实测（pHash O(n²) + dssim 候选组内）。已同步 core-analyze/core-model/core-scanner/ui-desktop 模块 md 与 INDEX。
 
 ### M3 · 批量操作与回收站
 
@@ -182,26 +185,28 @@ OxiGeo 可行性结论：**可以做，但不是照片足迹的核心依赖**。
 - 单元：模板解析、模糊阈值、分组算法、哈希冲突处理。
 - 集成：临时目录中的扫描→索引→筛选→删除→恢复→撤销完整链路。
 - UI 冒烟：每个里程碑结束后按“筛选 → 预览 → 确认 → 撤销”逐页手测一遍。
+
+
 - 性能基线：5000 张照片索引完成时间、相似分组完成时间、网格滚动帧率，逐里程碑记录。
 - 破坏性操作测试只能在临时目录进行，禁止用真实相册做验证。
 
 ## 8. 风险与应对
 
-| 风险 | 影响 | 应对 |
-| --- | --- | --- |
-| `../imageflow/*` 在仓库外 | 换机器直接构建失败 | M0 改为 git submodule 或 vendored，并固定 commit `7cbe26be` |
-| imageflow Rust API 不稳定 | 升级 imageflow 可能破坏编译 | 只在 `core/imaging.rs` 适配；依赖版本不跟随 C ABI tag |
+| 风险                               | 影响                                                                | 应对                                                                                     |
+| -------------------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `../imageflow/*` 在仓库外            | 换机器直接构建失败                                                         | M0 改为 git submodule 或 vendored，并固定 commit `7cbe26be`                                   |
+| imageflow Rust API 不稳定           | 升级 imageflow 可能破坏编译                                               | 只在 `core/imaging.rs` 适配；依赖版本不跟随 C ABI tag                                              |
 | imageflow `zen-codecs` 依赖 git 分支 | 需访问 GitHub 拉 zenjpeg/zenwebp main，且需复制 `[patch.crates-io]`；本机 502 | M0 基线暂用 c-codecs（本机有 NASM 可编译）；Cargo.toml 已注释切换配置，网络恢复后切换并重验；长期目标仍是 zen-codecs 免 C 工具链 |
-| imageflow AGPLv3 | 商业分发可能需要授权 | 已确认个人本地使用，暂不处理；若未来分发再评估授权或例外 |
-| 地图源合规 | 使用未资质地图源会有合规风险 | 只用腾讯/高德/百度/天地图；默认腾讯地图；坐标使用 GCJ-02 |
-| 地图 key 泄露或过期 | 足迹地图不可用 | 自行申请 key，代码中只保留占位符，配置 Referer 白名单，禁止内置可用 key |
-| OxiGeo 过度引入 | 编译体积与维护成本上升 | 只在需要 GeoJSON/聚类时引入，且只开 `geojson`（必要时 `proj`）feature |
-| gpui 0.2.2 版本较旧 | API 受限、升级成本高 | UI 逻辑集中在 `ui/`，core 不耦合 gpui |
-| 5000+ 张两两比较 | 相似分组不可用 | pHash 预筛 + 缩略图缓存 + 后台线程 |
-| 误删照片 | 不可逆数据丢失 | 只进回收站、操作日志、预览影响范围、二次确认 |
-| PRD 移动端信息架构与桌面实现不一致 | 返工 | M0 前确认桌面优先假设 |
-| 文档与源码漂移 | 后续 Agent 读到过期信息 | 结构性变更按 WORKFLOW.md 第 5/6 节同步模块 md 与 INDEX |
-| Claude.md 与 CODEBUDDY.md 双份维护 | 规则不一致 | 修改任一份时同步另一份 |
+| imageflow AGPLv3                 | 商业分发可能需要授权                                                        | 已确认个人本地使用，暂不处理；若未来分发再评估授权或例外                                                           |
+| 地图源合规                            | 使用未资质地图源会有合规风险                                                    | 只用腾讯/高德/百度/天地图；默认腾讯地图；坐标使用 GCJ-02                                                      |
+| 地图 key 泄露或过期                     | 足迹地图不可用                                                           | 自行申请 key，代码中只保留占位符，配置 Referer 白名单，禁止内置可用 key                                           |
+| OxiGeo 过度引入                      | 编译体积与维护成本上升                                                       | 只在需要 GeoJSON/聚类时引入，且只开 `geojson`（必要时 `proj`）feature                                    |
+| gpui 0.2.2 版本较旧                  | API 受限、升级成本高                                                      | UI 逻辑集中在 `ui/`，core 不耦合 gpui                                                           |
+| 5000+ 张两两比较                      | 相似分组不可用                                                           | pHash 预筛 + 缩略图缓存 + 后台线程                                                                |
+| 误删照片                             | 不可逆数据丢失                                                           | 只进回收站、操作日志、预览影响范围、二次确认                                                                 |
+| PRD 移动端信息架构与桌面实现不一致              | 返工                                                                | M0 前确认桌面优先假设                                                                           |
+| 文档与源码漂移                          | 后续 Agent 读到过期信息                                                   | 结构性变更按 WORKFLOW.md 第 5/6 节同步模块 md 与 INDEX                                              |
+| Claude.md 与 CODEBUDDY.md 双份维护    | 规则不一致                                                             | 修改任一份时同步另一份                                                                            |
 
 ## 9. 文档同步约定
 
@@ -220,4 +225,4 @@ OxiGeo 可行性结论：**可以做，但不是照片足迹的核心依赖**。
 4. 把 imageflow 改为 `zen-codecs` 纯 Rust 路径，移除 `imageflow_helpers` 直接依赖，并验证 `cargo check` 不再需要 NASM / VS Build Tools。
 5. 用固定 commit `7cbe26be` 的 git submodule 引入 imageflow（AGPLv3 个人使用已确认可接受），不再评估 HEIC 依赖。
 6. 照片足迹本期暂缓：不实现 EXIF GPS → GCJ-02 → 地图链路，不引入 OxiGeo / 地图 SDK / GCJ-02 依赖；相关规划保留在 M4+，待整理链路闭环后再评估启动。
-7. 进入 M1；“桌面优先”与“个人本地使用”两项前提已确认。
+7. 进入 M1；“桌**面优先”与“个人本地使用**”两项前提已确认。

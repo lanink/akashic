@@ -2,6 +2,7 @@
 //!
 //! 依赖方向约束：`main.rs → ui → core → 外部设施`。core 不得引用 gpui。
 
+pub mod analyze;
 pub mod config;
 pub mod db;
 pub mod model;

@@ -28,6 +28,14 @@ pub struct Photo {
     /// GPS 字段预留（本期暂缓采集与展示）
     pub gps_lon_wgs84: Option<f64>,
     pub gps_lat_wgs84: Option<f64>,
+    /// M2 分析结果：模糊评分（Laplacian 方差，未分析时为 None）
+    pub blur_score: Option<f64>,
+    /// M2 分析结果：是否截图
+    pub is_screenshot: bool,
+    /// M2 分析结果：感知哈希（用于相似归组）
+    pub phash: Option<u64>,
+    /// M2 分析结果：所属相似组 id
+    pub group_id: Option<i64>,
 }
 
 impl Photo {
@@ -59,6 +67,20 @@ impl Photo {
     pub fn tag_list(&self) -> Vec<&str> {
         self.tags.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
     }
+
+    /// 是否已参加过分析。
+    pub fn is_analyzed(&self) -> bool {
+        self.blur_score.is_some()
+    }
+}
+
+/// 相似照片分组（对应 SQLite `photo_groups` 表 + 成员列表）。
+#[derive(Clone, Debug)]
+pub struct PhotoGroup {
+    pub id: i64,
+    pub rule: String,
+    pub created_at: i64,
+    pub members: Vec<Photo>,
 }
 
 /// 一个用户选择的扫描根目录。

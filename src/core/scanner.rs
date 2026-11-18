@@ -191,6 +191,10 @@ pub fn scan_root(
             thumbnail_path: thumb_path,
             gps_lon_wgs84: None, // 本期暂缓 GPS
             gps_lat_wgs84: None,
+            blur_score: None,
+            is_screenshot: false,
+            phash: None,
+            group_id: None,
         };
 
         match db::upsert_photo(&tx, &photo, root_id) {

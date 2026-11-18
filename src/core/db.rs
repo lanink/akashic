@@ -54,13 +54,25 @@ fn migrate(conn: &Connection) -> Result<()> {
             thumbnail_path  TEXT,
             gps_lon_wgs84   REAL,
             gps_lat_wgs84   REAL,
-            scan_root_id    INTEGER REFERENCES scan_roots(id) ON DELETE CASCADE
+            scan_root_id    INTEGER REFERENCES scan_roots(id) ON DELETE CASCADE,
+            blur_score      REAL,
+            is_screenshot   INTEGER NOT NULL DEFAULT 0,
+            phash           INTEGER,
+            group_id        INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_photos_path ON photos(path);
         CREATE INDEX IF NOT EXISTS idx_photos_hash ON photos(content_hash);
         CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken);
         CREATE INDEX IF NOT EXISTS idx_photos_root ON photos(scan_root_id);
+        CREATE INDEX IF NOT EXISTS idx_photos_blur ON photos(blur_score);
+        CREATE INDEX IF NOT EXISTS idx_photos_group ON photos(group_id);
+
+        CREATE TABLE IF NOT EXISTS photo_groups (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule            TEXT NOT NULL DEFAULT 'phash+dssim',
+            created_at      INTEGER NOT NULL DEFAULT 0
+        );
 
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
@@ -69,8 +81,32 @@ fn migrate(conn: &Connection) -> Result<()> {
         ",
     )
     .context("迁移 schema 失败")?;
+
+    // M1 老库迁移：新库在建表时已含这些列，老库按需补列，避免重复 ALTER 报错。
+    {
+        let cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(photos)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
+        };
+        let add = |name: &str, ddl: &str| -> Result<()> {
+            if !cols.contains(name) {
+                conn.execute(ddl, [])?;
+            }
+            Ok(())
+        };
+        add("blur_score", "ALTER TABLE photos ADD COLUMN blur_score REAL")?;
+        add("is_screenshot", "ALTER TABLE photos ADD COLUMN is_screenshot INTEGER NOT NULL DEFAULT 0")?;
+        add("phash", "ALTER TABLE photos ADD COLUMN phash INTEGER")?;
+        add("group_id", "ALTER TABLE photos ADD COLUMN group_id INTEGER")?;
+    }
     Ok(())
 }
+
+/// photos 表的稳定列顺序（避免 `SELECT *` 因迁移加列导致位置映射错位）。
+const PHOTO_COLUMNS: &str = "id, path, file_name, size_bytes, date_taken, modified_at, \
+     width, height, device, location, tags, content_hash, thumbnail_path, \
+     gps_lon_wgs84, gps_lat_wgs84, blur_score, is_screenshot, phash, group_id";
 
 // ===== scan_roots =====
 
@@ -117,7 +153,7 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
 /// 按路径查询单张照片。
 pub fn get_photo_by_path(conn: &Connection, path: &Path) -> Result<Option<Photo>> {
     conn.query_row(
-        "SELECT * FROM photos WHERE path = ?1",
+        &format!("SELECT {PHOTO_COLUMNS} FROM photos WHERE path = ?1"),
         params![path.to_string_lossy()],
         row_to_photo,
     )
@@ -150,7 +186,8 @@ pub fn upsert_photo(conn: &Connection, photo: &Photo, root_id: i64) -> Result<bo
         conn.execute(
             "UPDATE photos SET file_name=?2, size_bytes=?3, date_taken=?4, modified_at=?5,
                     width=?6, height=?7, device=?8, location=?9, tags=?10, content_hash=?11,
-                    thumbnail_path=?12, gps_lon_wgs84=?13, gps_lat_wgs84=?14, scan_root_id=?15
+                    thumbnail_path=?12, gps_lon_wgs84=?13, gps_lat_wgs84=?14, scan_root_id=?15,
+                    blur_score=NULL, is_screenshot=0, phash=NULL, group_id=NULL
              WHERE id=?1",
             params![
                 id,
@@ -200,7 +237,7 @@ pub fn upsert_photo(conn: &Connection, photo: &Photo, root_id: i64) -> Result<bo
 
 /// 列出所有照片（按拍摄时间倒序）。
 pub fn list_photos(conn: &Connection) -> Result<Vec<Photo>> {
-    let mut stmt = conn.prepare("SELECT * FROM photos ORDER BY date_taken DESC, id DESC")?;
+    let mut stmt = conn.prepare(&format!("SELECT {PHOTO_COLUMNS} FROM photos ORDER BY date_taken DESC, id DESC"))?;
     let rows = stmt.query_map([], row_to_photo)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().context("列出照片失败")
 }
@@ -208,9 +245,9 @@ pub fn list_photos(conn: &Connection) -> Result<Vec<Photo>> {
 /// 列出指定扫描根目录下（路径前缀匹配）的照片。
 pub fn list_photos_under(conn: &Connection, root: &Path) -> Result<Vec<Photo>> {
     let prefix = format!("{}%", root.to_string_lossy());
-    let mut stmt = conn.prepare(
-        "SELECT * FROM photos WHERE path LIKE ?1 ORDER BY date_taken DESC, id DESC",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PHOTO_COLUMNS} FROM photos WHERE path LIKE ?1 ORDER BY date_taken DESC, id DESC"
+    ))?;
     let rows = stmt.query_map(params![prefix], row_to_photo)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().context("按目录列出照片失败")
 }
@@ -218,11 +255,11 @@ pub fn list_photos_under(conn: &Connection, root: &Path) -> Result<Vec<Photo>> {
 /// 按关键词搜索文件名 / 地点 / 标签。
 pub fn search_photos(conn: &Connection, keyword: &str) -> Result<Vec<Photo>> {
     let pattern = format!("%{}%", keyword);
-    let mut stmt = conn.prepare(
-        "SELECT * FROM photos
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PHOTO_COLUMNS} FROM photos
          WHERE file_name LIKE ?1 OR location LIKE ?1 OR tags LIKE ?1
-         ORDER BY date_taken DESC, id DESC",
-    )?;
+         ORDER BY date_taken DESC, id DESC"
+    ))?;
     let rows = stmt.query_map(params![pattern], row_to_photo)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().context("搜索照片失败")
 }
@@ -244,6 +281,108 @@ pub fn count_photos(conn: &Connection) -> Result<i64> {
 pub fn total_size_bytes(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COALESCE(SUM(size_bytes),0) FROM photos", [], |row| row.get(0))
         .context("统计占用空间失败")
+}
+
+// ===== 分析结果（M2） =====
+
+/// 写入单张照片的分析结果。phash 为 u64，按位存为 INTEGER，读出时转回 u64。
+pub fn update_analysis(
+    conn: &Connection,
+    photo_id: i64,
+    blur_score: f64,
+    is_screenshot: bool,
+    phash: Option<u64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE photos SET blur_score=?2, is_screenshot=?3, phash=?4 WHERE id=?1",
+        params![photo_id, blur_score, is_screenshot as i64, phash.map(|h| h as i64)],
+    )?;
+    Ok(())
+}
+
+/// 保存相似分组：清空旧组后重建（分析是全量重算）。
+pub fn save_similar_groups(conn: &Connection, groups: &[Vec<i64>], created_at: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction().context("开启分组写入事务失败")?;
+    tx.execute("UPDATE photos SET group_id = NULL", [])?;
+    tx.execute("DELETE FROM photo_groups", [])?;
+    for members in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO photo_groups (rule, created_at) VALUES ('phash+dssim', ?1)",
+            params![created_at],
+        )?;
+        let group_id = tx.last_insert_rowid();
+        for id in members {
+            tx.execute("UPDATE photos SET group_id = ?2 WHERE id = ?1", params![id, group_id])?;
+        }
+    }
+    tx.commit().context("提交分组写入失败")?;
+    Ok(())
+}
+
+/// 列出所有相似组及其成员照片。
+pub fn list_photo_groups(conn: &Connection) -> Result<Vec<crate::core::model::PhotoGroup>> {
+    use crate::core::model::PhotoGroup;
+    let mut stmt = conn.prepare(
+        "SELECT id, rule, created_at FROM photo_groups ORDER BY created_at DESC, id DESC",
+    )?;
+    let headers = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut groups = Vec::new();
+    for (id, rule, created_at) in headers {
+        let mut mstmt = conn.prepare(&format!(
+            "SELECT {PHOTO_COLUMNS} FROM photos WHERE group_id = ?1 ORDER BY id"
+        ))?;
+        let members = mstmt
+            .query_map(params![id], row_to_photo)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        groups.push(PhotoGroup { id, rule, created_at, members });
+    }
+    Ok(groups)
+}
+
+/// 按模糊分升序返回最模糊的 N 张（仅已分析照片）。
+pub fn list_blurry(conn: &Connection, limit: usize) -> Result<Vec<Photo>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PHOTO_COLUMNS} FROM photos WHERE blur_score IS NOT NULL \
+         ORDER BY blur_score ASC LIMIT ?1"
+    ))?;
+    stmt.query_map(params![limit as i64], row_to_photo)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("查询模糊照片失败")
+}
+
+/// 列出所有被判定为截图的照片。
+pub fn list_screenshots(conn: &Connection) -> Result<Vec<Photo>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PHOTO_COLUMNS} FROM photos WHERE is_screenshot = 1 \
+         ORDER BY date_taken DESC, id DESC"
+    ))?;
+    stmt.query_map([], row_to_photo)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("查询截图失败")
+}
+
+/// 按文件大小降序返回前 N 张大文件。
+pub fn list_large_files(conn: &Connection, limit: usize) -> Result<Vec<Photo>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {PHOTO_COLUMNS} FROM photos ORDER BY size_bytes DESC LIMIT ?1"
+    ))?;
+    stmt.query_map(params![limit as i64], row_to_photo)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("查询大文件失败")
+}
+
+/// 统计已分析照片数。
+pub fn count_analyzed(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM photos WHERE blur_score IS NOT NULL", [], |row| row.get(0))
+        .context("统计已分析照片数失败")
 }
 
 /// 增量扫描清理：删除指定扫描根目录下、不在本次存活路径集合中的照片记录。
@@ -280,6 +419,10 @@ fn row_to_photo(row: &rusqlite::Row<'_>) -> rusqlite::Result<Photo> {
         thumbnail_path: row.get::<_, Option<String>>(12)?.map(PathBuf::from),
         gps_lon_wgs84: row.get(13)?,
         gps_lat_wgs84: row.get(14)?,
+        blur_score: row.get(15)?,
+        is_screenshot: row.get::<_, i64>(16)? != 0,
+        phash: row.get::<_, Option<i64>>(17)?.map(|v| v as u64),
+        group_id: row.get(18)?,
     })
 }
 
@@ -313,6 +456,10 @@ mod tests {
             thumbnail_path: None,
             gps_lon_wgs84: None,
             gps_lat_wgs84: None,
+            blur_score: None,
+            is_screenshot: false,
+            phash: None,
+            group_id: None,
         }
     }
 
