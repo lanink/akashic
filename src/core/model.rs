@@ -125,6 +125,117 @@ pub enum ScanProgress {
     Failed { message: String },
 }
 
+// ===== M3 批量操作与回收站 =====
+
+/// 批量操作类型（对应 `op_log.kind`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpKind {
+    /// 删除到回收站
+    Trash,
+    /// 从回收站恢复
+    Restore,
+    /// 批量重命名
+    Rename,
+    /// 清空回收站
+    EmptyTrash,
+    /// 清理超过保留期的回收站项目
+    Purge,
+}
+
+impl OpKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OpKind::Trash => "trash",
+            OpKind::Restore => "restore",
+            OpKind::Rename => "rename",
+            OpKind::EmptyTrash => "empty_trash",
+            OpKind::Purge => "purge",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "restore" => OpKind::Restore,
+            "rename" => OpKind::Rename,
+            "empty_trash" => OpKind::EmptyTrash,
+            "purge" => OpKind::Purge,
+            _ => OpKind::Trash,
+        }
+    }
+}
+
+/// 一次批量操作的日志头（对应 `op_log` 表一行）。
+#[derive(Clone, Debug)]
+pub struct OpLog {
+    pub id: i64,
+    pub kind: OpKind,
+    pub created_at: i64,
+    pub item_count: usize,
+    pub detail: String,
+}
+
+/// 批量操作中的单条路径映射（对应 `op_entries` 表一行）。
+/// 重命名：`old_path` → `new_path`；删除：原路径 → 回收站路径。
+#[derive(Clone, Debug)]
+pub struct OpEntry {
+    pub id: i64,
+    pub op_id: i64,
+    pub old_path: PathBuf,
+    pub new_path: PathBuf,
+}
+
+/// 回收站项目：保存文件的回收站路径与原始元数据快照，用于完整恢复索引记录。
+#[derive(Clone, Debug)]
+pub struct TrashItem {
+    pub id: i64,
+    pub op_id: i64,
+    pub original_path: PathBuf,
+    pub trash_path: PathBuf,
+    pub trashed_at: i64,
+    /// 删除前照片记录快照（id 为原照片 id，path 为 original_path）
+    pub photo: Photo,
+}
+
+/// 删除到回收站的结果汇总。
+#[derive(Clone, Debug, Default)]
+pub struct TrashResult {
+    pub count: usize,
+    pub bytes: i64,
+    pub op_id: i64,
+}
+
+/// 重命名模板引擎的渲染上下文（由一张真实照片派生）。
+#[derive(Clone, Debug)]
+pub struct RenameContext {
+    pub date: String,
+    pub time: String,
+    pub tag: String,
+    pub location: String,
+    pub extension: String,
+}
+
+/// 重命名预览中的一条：原名 → 新名。
+#[derive(Clone, Debug)]
+pub struct RenamePreviewItem {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// 重命名预览：前若干条样例 + 总数（对话框只展示 3-5 条）。
+#[derive(Clone, Debug, Default)]
+pub struct RenamePreview {
+    pub items: Vec<RenamePreviewItem>,
+    pub total: usize,
+}
+
+/// 批量重命名执行结果。
+#[derive(Clone, Debug, Default)]
+pub struct RenameResult {
+    pub count: usize,
+    pub op_id: i64,
+    pub samples: Vec<RenamePreviewItem>,
+}
+
 // ===== 以下为 M0 模拟数据，UI 切换完成后移除 =====
 
 /// 设计稿中的模拟照片定义。

@@ -4,3 +4,4 @@ pub mod analyze;
 pub mod app;
 pub mod assets;
 pub mod library;
+pub mod ops;

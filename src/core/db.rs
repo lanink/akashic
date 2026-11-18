@@ -72,6 +72,45 @@ fn migrate(conn: &Connection) -> Result<()> {
             created_at      INTEGER NOT NULL DEFAULT 0
         );
 
+        -- M3 批量操作与回收站
+        CREATE TABLE IF NOT EXISTS op_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind        TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            item_count  INTEGER NOT NULL DEFAULT 0,
+            detail      TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS op_entries (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            op_id     INTEGER NOT NULL REFERENCES op_log(id) ON DELETE CASCADE,
+            old_path  TEXT NOT NULL,
+            new_path  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_op_entries_op ON op_entries(op_id);
+
+        CREATE TABLE IF NOT EXISTS trash_items (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            op_id          INTEGER,
+            original_path  TEXT NOT NULL,
+            trash_path     TEXT NOT NULL UNIQUE,
+            trashed_at     INTEGER NOT NULL,
+            -- 原照片元数据快照（恢复时据此重建索引行，避免重新扫描）
+            file_name      TEXT NOT NULL,
+            size_bytes     INTEGER NOT NULL,
+            date_taken     TEXT,
+            modified_at    INTEGER NOT NULL,
+            width          INTEGER NOT NULL DEFAULT 0,
+            height         INTEGER NOT NULL DEFAULT 0,
+            device         TEXT,
+            location       TEXT,
+            tags           TEXT NOT NULL DEFAULT '',
+            content_hash   TEXT NOT NULL DEFAULT '',
+            thumbnail_path TEXT,
+            scan_root_id   INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_trash_trashed_at ON trash_items(trashed_at);
+
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -244,6 +283,17 @@ pub fn upsert_photo(conn: &Connection, photo: &Photo, root_id: i64) -> Result<bo
     Ok(true)
 }
 
+/// 按 id 查询单张照片。
+pub fn get_photo_by_id(conn: &Connection, id: i64) -> Result<Option<Photo>> {
+    conn.query_row(
+        &format!("SELECT {PHOTO_COLUMNS} FROM photos WHERE id = ?1"),
+        params![id],
+        row_to_photo,
+    )
+    .optional()
+    .context("按 id 查询照片失败")
+}
+
 /// 列出所有照片（按拍摄时间倒序）。
 pub fn list_photos(conn: &Connection) -> Result<Vec<Photo>> {
     let mut stmt = conn.prepare(&format!("SELECT {PHOTO_COLUMNS} FROM photos ORDER BY date_taken DESC, id DESC"))?;
@@ -409,6 +459,276 @@ pub fn sweep_photos(conn: &Connection, root: &Path, alive_paths: &[PathBuf]) -> 
         }
     }
     Ok(removed)
+}
+
+// ===== 批量操作与回收站（M3） =====
+
+use crate::core::model::{OpEntry, OpKind, OpLog, TrashItem};
+
+/// 记录一次批量操作，返回 op_id。
+pub fn insert_op_log(
+    conn: &Connection,
+    kind: &OpKind,
+    created_at: i64,
+    item_count: usize,
+    detail: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO op_log (kind, created_at, item_count, detail) VALUES (?1,?2,?3,?4)",
+        params![kind.as_str(), created_at, item_count as i64, detail],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 记录一条路径映射（重命名 old→new、删除 原路径→回收站路径）。
+pub fn insert_op_entry(conn: &Connection, op_id: i64, old: &Path, new: &Path) -> Result<()> {
+    conn.execute(
+        "INSERT INTO op_entries (op_id, old_path, new_path) VALUES (?1,?2,?3)",
+        params![op_id, old.to_string_lossy(), new.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
+/// 列出某次操作的全部路径映射（按 id 升序，便于撤销时逆序恢复）。
+pub fn list_op_entries(conn: &Connection, op_id: i64) -> Result<Vec<OpEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, op_id, old_path, new_path FROM op_entries WHERE op_id=?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![op_id], |row| {
+        Ok(OpEntry {
+            id: row.get(0)?,
+            op_id: row.get(1)?,
+            old_path: PathBuf::from(row.get::<_, String>(2)?),
+            new_path: PathBuf::from(row.get::<_, String>(3)?),
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().context("列出操作映射失败")
+}
+
+/// 列出最近 N 条操作日志（时间倒序）。
+pub fn list_ops(conn: &Connection, limit: usize) -> Result<Vec<OpLog>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, created_at, item_count, detail \
+         FROM op_log ORDER BY created_at DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        Ok(OpLog {
+            id: row.get(0)?,
+            kind: OpKind::from_str(&row.get::<_, String>(1)?),
+            created_at: row.get(2)?,
+            item_count: row.get::<_, i64>(3)? as usize,
+            detail: row.get(4)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().context("列出操作日志失败")
+}
+
+/// 按 id 取一条操作日志。
+pub fn get_op(conn: &Connection, id: i64) -> Result<Option<OpLog>> {
+    conn.query_row(
+        "SELECT id, kind, created_at, item_count, detail FROM op_log WHERE id=?1",
+        params![id],
+        |row| {
+            Ok(OpLog {
+                id: row.get(0)?,
+                kind: OpKind::from_str(&row.get::<_, String>(1)?),
+                created_at: row.get(2)?,
+                item_count: row.get::<_, i64>(3)? as usize,
+                detail: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .context("查询操作日志失败")
+}
+
+/// 删除一条操作日志（及其映射，靠外键级联）。
+pub fn delete_op(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM op_log WHERE id=?1", params![id])?;
+    Ok(())
+}
+
+/// 把一张照片连同元数据快照移入回收站表。
+pub fn insert_trash_item(conn: &Connection, item: &TrashItem) -> Result<i64> {
+    let p = &item.photo;
+    conn.execute(
+        "INSERT INTO trash_items
+            (op_id, original_path, trash_path, trashed_at, file_name, size_bytes, date_taken,
+             modified_at, width, height, device, location, tags, content_hash,
+             thumbnail_path, scan_root_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        params![
+            item.op_id,
+            item.original_path.to_string_lossy(),
+            item.trash_path.to_string_lossy(),
+            item.trashed_at,
+            p.file_name,
+            p.size_bytes,
+            p.date_taken,
+            p.modified_at,
+            p.width,
+            p.height,
+            p.device,
+            p.location,
+            p.tags,
+            p.content_hash,
+            p.thumbnail_path.as_ref().map(|x| x.to_string_lossy().to_string()),
+            None::<i64>, // scan_root_id 快照暂不保存（本期回收站按原路径恢复即可）
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 列出回收站项目（时间倒序）。
+pub fn list_trash(conn: &Connection) -> Result<Vec<TrashItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, op_id, original_path, trash_path, trashed_at,
+                file_name, size_bytes, date_taken, modified_at, width, height,
+                device, location, tags, content_hash, thumbnail_path, scan_root_id
+         FROM trash_items ORDER BY trashed_at DESC, id DESC",
+    )?;
+    // 兼容：老表可能没有 op_id 列（本里程碑内所有库都新建该表，故直接用）
+    let rows = stmt.query_map([], row_to_trash_item)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().context("列出回收站失败")
+}
+
+/// 按 id 取回收站项目。
+pub fn get_trash_item(conn: &Connection, id: i64) -> Result<Option<TrashItem>> {
+    conn.query_row(
+        "SELECT id, op_id, original_path, trash_path, trashed_at,
+                file_name, size_bytes, date_taken, modified_at, width, height,
+                device, location, tags, content_hash, thumbnail_path, scan_root_id
+         FROM trash_items WHERE id=?1",
+        params![id],
+        row_to_trash_item,
+    )
+    .optional()
+    .context("查询回收站项目失败")
+}
+
+/// 从回收站表移除一条记录（文件层面由 ops 层负责）。
+pub fn delete_trash_item(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM trash_items WHERE id=?1", params![id])?;
+    Ok(())
+}
+
+/// 列出某次删除操作对应的回收站项目 id（按 id 升序）。
+pub fn list_trash_by_op(conn: &Connection, op_id: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM trash_items WHERE op_id=?1 ORDER BY id")?;
+    let rows = stmt.query_map(params![op_id], |row| row.get::<_, i64>(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().context("列出操作回收站项失败")
+}
+
+/// 回收站项目计数与占用空间。
+pub fn trash_summary(conn: &Connection) -> Result<(usize, i64)> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM trash_items",
+        [],
+        |row| Ok((row.get::<_, i64>(0)? as usize, row.get::<_, i64>(1)?)),
+    )
+    .context("统计回收站失败")
+}
+
+/// 查询超过保留期（trashed_at <= cutoff）的回收站项目。
+pub fn list_expired_trash(conn: &Connection, cutoff: i64) -> Result<Vec<TrashItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, op_id, original_path, trash_path, trashed_at,
+                file_name, size_bytes, date_taken, modified_at, width, height,
+                device, location, tags, content_hash, thumbnail_path, scan_root_id
+         FROM trash_items WHERE trashed_at <= ?1 ORDER BY trashed_at",
+    )?;
+    stmt.query_map(params![cutoff], row_to_trash_item)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("查询过期回收站项目失败")
+}
+
+/// 按路径删除一条照片索引记录（文件层面由 ops 层负责）。
+pub fn delete_photo_by_path(conn: &Connection, path: &Path) -> Result<()> {
+    conn.execute("DELETE FROM photos WHERE path=?1", params![path.to_string_lossy()])?;
+    Ok(())
+}
+
+/// 从快照恢复一条照片索引记录（恢复时调用）。
+pub fn restore_photo(conn: &Connection, p: &Photo, root_id: Option<i64>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO photos (path, file_name, size_bytes, date_taken, modified_at,
+                width, height, device, location, tags, content_hash, thumbnail_path,
+                gps_lon_wgs84, gps_lat_wgs84, scan_root_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+         ON CONFLICT(path) DO UPDATE SET
+                file_name=excluded.file_name, size_bytes=excluded.size_bytes,
+                date_taken=excluded.date_taken, modified_at=excluded.modified_at,
+                width=excluded.width, height=excluded.height, device=excluded.device,
+                location=excluded.location, tags=excluded.tags,
+                content_hash=excluded.content_hash, thumbnail_path=excluded.thumbnail_path,
+                scan_root_id=excluded.scan_root_id",
+        params![
+            p.path.to_string_lossy(),
+            p.file_name,
+            p.size_bytes,
+            p.date_taken,
+            p.modified_at,
+            p.width,
+            p.height,
+            p.device,
+            p.location,
+            p.tags,
+            p.content_hash,
+            p.thumbnail_path.as_ref().map(|x| x.to_string_lossy().to_string()),
+            p.gps_lon_wgs84,
+            p.gps_lat_wgs84,
+            root_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// 更新一张照片的文件名与路径（重命名后调用）。
+pub fn rename_photo_path(
+    conn: &Connection,
+    photo_id: i64,
+    new_path: &Path,
+    new_name: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE photos SET path=?2, file_name=?3 WHERE id=?1",
+        params![photo_id, new_path.to_string_lossy(), new_name],
+    )?;
+    Ok(())
+}
+
+fn row_to_trash_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrashItem> {
+    let original_path = PathBuf::from(row.get::<_, String>(2)?);
+    let file_name: String = row.get(5)?;
+    let photo = Photo {
+        id: 0,
+        path: original_path.clone(),
+        file_name,
+        size_bytes: row.get(6)?,
+        date_taken: row.get(7)?,
+        modified_at: row.get(8)?,
+        width: row.get(9)?,
+        height: row.get(10)?,
+        device: row.get(11)?,
+        location: row.get(12)?,
+        tags: row.get(13)?,
+        content_hash: row.get(14)?,
+        thumbnail_path: row.get::<_, Option<String>>(15)?.map(PathBuf::from),
+        gps_lon_wgs84: None,
+        gps_lat_wgs84: None,
+        blur_score: None,
+        is_screenshot: false,
+        phash: None,
+        group_id: None,
+    };
+    Ok(TrashItem {
+        id: row.get(0)?,
+        op_id: row.get(1)?,
+        original_path,
+        trash_path: PathBuf::from(row.get::<_, String>(3)?),
+        trashed_at: row.get(4)?,
+        photo,
+    })
 }
 
 fn row_to_photo(row: &rusqlite::Row<'_>) -> rusqlite::Result<Photo> {

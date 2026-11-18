@@ -12,9 +12,11 @@ use gpui_component::WindowExt;
 
 use crate::core::analyze::{AnalyzeProgress, AnalyzeReport};
 use crate::core::config::Paths;
+use crate::core::ops::{rename as ops_rename, trash as ops_trash};
 use crate::core::model::{ScanProgress, ScanStats};
 use crate::ui::analyze::AnalyzeData;
 use crate::ui::library::LibraryData;
+use crate::ui::ops::OpsData;
 
 // ===== 设计稿配色（akashic-ds.html） =====
 const PRIMARY: u32 = 0x1A2634; // 深蓝 主色
@@ -81,6 +83,16 @@ pub struct AppState {
     analyze_status: String,
     /// 整理页当前打开的工具列表（None 表示工具卡片总览）
     active_tool: Option<OrganizeTool>,
+    /// M3 回收站/操作日志快照
+    ops_data: OpsData,
+    /// 状态提示（批量操作结果）
+    ops_status: String,
+    /// 重命名模板与前缀（重命名页输入）
+    rename_pattern: String,
+    rename_prefix: String,
+    /// 最近一次可撤销的重命名/删除操作 id
+    last_rename_op: Option<i64>,
+    last_trash_op: Option<i64>,
 }
 
 /// 整理页的 4 个分析工具。
@@ -97,12 +109,13 @@ impl AppState {
         cx.new(|_| {
             // 启动时尝试从已有索引加载；失败则用空快照（不影响 UI 启动）
             let db_path = paths.db_path.clone();
-            let (data, analyze_data) = match crate::core::db::open(&db_path) {
+            let (data, analyze_data, ops_data) = match crate::core::db::open(&db_path) {
                 Ok(conn) => (
                     LibraryData::reload(&conn).unwrap_or_default(),
                     AnalyzeData::reload(&conn).unwrap_or_default(),
+                    OpsData::reload(&conn).unwrap_or_default(),
                 ),
-                Err(_) => (LibraryData::default(), AnalyzeData::default()),
+                Err(_) => (LibraryData::default(), AnalyzeData::default(), OpsData::default()),
             };
             Self {
                 page: Page::Library,
@@ -119,8 +132,122 @@ impl AppState {
                 is_analyzing: false,
                 analyze_status: String::new(),
                 active_tool: None,
+                ops_data,
+                ops_status: String::new(),
+                rename_pattern: "{前缀}_{日期}_{序号:3}".to_string(),
+                rename_prefix: String::new(),
+                last_rename_op: None,
+                last_trash_op: None,
             }
         })
+    }
+
+    /// 统一刷新三个数据快照（批量操作后调用）。
+    fn reload_all(&mut self) {
+        if let Ok(conn) = crate::core::db::open(&self.paths.db_path) {
+            self.data = LibraryData::reload(&conn).unwrap_or_default();
+            self.analyze_data = AnalyzeData::reload(&conn).unwrap_or_default();
+            self.ops_data = OpsData::reload(&conn).unwrap_or_default();
+        }
+    }
+
+    /// 当前多选对应的照片 id（按可见列表索引映射）。
+    fn selected_photo_ids(&self) -> Vec<i64> {
+        let visible = self.data.visible_photos();
+        self.selected
+            .iter()
+            .filter_map(|&idx| visible.get(idx).map(|p| p.id))
+            .collect()
+    }
+
+    /// 批量删除选中照片到回收站（同步执行，数量通常不大）。
+    fn batch_trash(&mut self) {
+        let ids = self.selected_photo_ids();
+        if ids.is_empty() {
+            self.ops_status = "请先选择照片（Ctrl+点按多选）".to_string();
+            return;
+        }
+        let count = ids.len();
+        let paths = self.paths.clone();
+        let result = crate::core::db::open(&paths.db_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| ops_trash::trash_photos(&paths, &conn, &ids));
+        match result {
+            Ok(r) => {
+                self.last_trash_op = Some(r.op_id);
+                self.ops_status = format!(
+                    "已将 {} 张移动到回收站（{:.1} MB）· 可在回收站恢复或撤销",
+                    count,
+                    r.bytes as f64 / 1024.0 / 1024.0
+                );
+                self.selected.clear();
+                self.reload_all();
+            }
+            Err(e) => self.ops_status = format!("删除失败：{e}"),
+        }
+    }
+
+    /// 批量重命名选中照片（用当前 pattern/prefix）。
+    fn batch_rename(&mut self) {
+        let ids = self.selected_photo_ids();
+        if ids.is_empty() {
+            self.ops_status = "请先选择照片（Ctrl+点按多选）".to_string();
+            return;
+        }
+        let pattern = self.rename_pattern.clone();
+        let prefix = self.rename_prefix.clone();
+        let paths = self.paths.clone();
+        let result = crate::core::db::open(&paths.db_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| ops_rename::execute(&conn, &ids, &pattern, &prefix));
+        match result {
+            Ok(r) => {
+                self.last_rename_op = Some(r.op_id);
+                self.ops_status = format!("已重命名 {} 张 · 可点「撤销上次重命名」恢复", r.count);
+                self.selected.clear();
+                self.reload_all();
+            }
+            Err(e) => self.ops_status = format!("重命名失败：{e}"),
+        }
+    }
+
+    /// 撤销最近一次重命名。
+    fn undo_rename(&mut self) {
+        let Some(op_id) = self.last_rename_op else {
+            self.ops_status = "没有可撤销的重命名操作".to_string();
+            return;
+        };
+        let result = crate::core::db::open(&self.paths.db_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| ops_rename::undo(&conn, op_id));
+        match result {
+            Ok(n) => {
+                self.ops_status = format!("已撤销重命名，恢复 {n} 张");
+                self.last_rename_op = None;
+                self.reload_all();
+            }
+            Err(e) => self.ops_status = format!("撤销失败：{e}"),
+        }
+    }
+
+    /// 撤销最近一次删除。
+    fn undo_trash(&mut self) {
+        let Some(op_id) = self.last_trash_op else {
+            self.ops_status = "没有可撤销的删除操作".to_string();
+            return;
+        };
+        let paths = self.paths.clone();
+        let result = crate::core::db::open(&paths.db_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| ops_trash::undo_trash(&paths, &conn, op_id));
+        match result {
+            Ok(n) => {
+                self.ops_status = format!("已撤销删除，恢复 {n} 张");
+                self.last_trash_op = None;
+                self.reload_all();
+            }
+            Err(e) => self.ops_status = format!("撤销失败：{e}"),
+        }
     }
 
     /// 当前可见照片数量（供 UI 显示）。
@@ -453,7 +580,7 @@ impl AppRoot {
     /// 深色侧边导航栏
     fn sidebar(&self, state: &AppState) -> impl IntoElement + 'static {
         let app = &self.app;
-        let nav = |page: Page, icon: IconName, label: &'static str, badge: Option<&'static str>| {
+        let nav = |page: Page, icon: IconName, label: &'static str, badge: Option<String>| {
             let active = state.page == page;
             let app = app.clone();
             let btn = Button::new(label)
@@ -483,7 +610,7 @@ impl AppRoot {
                             .rounded_full()
                             .when(active, |e| e.bg(rgba(201, 169, 110, 0.2)).text_color(col(GOLD)))
                             .when(!active, |e| e.bg(rgba(255, 255, 255, 0.08)).text_color(rgba(255, 255, 255, 0.5)))
-                            .child(badge_text),
+                            .child(SharedString::from(badge_text)),
                     ])
                 })
                 .on_click(move |_ev, _w, cx| {
@@ -521,10 +648,24 @@ impl AppRoot {
             .bg(col(BG_SIDEBAR))
             .pt(px(4.))
             .child(nav(Page::Home, IconName::LayoutDashboard, "首页", None))
-            .child(nav(Page::Organize, IconName::Settings2, "智能整理", Some("12")))
-            .child(nav(Page::Library, IconName::GalleryVerticalEnd, "相册库", Some("1,247")))
+            .child(nav(Page::Organize, IconName::Settings2, "智能整理", Some("12".to_string())))
+            .child(nav(
+                Page::Library,
+                IconName::GalleryVerticalEnd,
+                "相册库",
+                Some(format!("{}", state.data.total_count)),
+            ))
             .child(nav(Page::Rename, IconName::CaseSensitive, "重命名", None))
-            .child(nav(Page::Trash, IconName::Delete, "回收站", Some("4")))
+            .child(nav(
+                Page::Trash,
+                IconName::Delete,
+                "回收站",
+                if state.ops_data.trash_count > 0 {
+                    Some(format!("{}", state.ops_data.trash_count))
+                } else {
+                    None
+                },
+            ))
             .child(div().id("sidebar-divider").h(px(1.)).my(px(12.)).mx(px(20.)).bg(rgba(255, 255, 255, 0.06)))
             .child(setting_btn)
             .child(
@@ -553,12 +694,8 @@ impl AppRoot {
             Page::Home => self.page_home(state).into_any_element(),
             Page::Organize => self.page_organize(state).into_any_element(),
             Page::Library => self.page_library(state).into_any_element(),
-            Page::Rename => self
-                .page_placeholder(IconName::CaseSensitive, "重命名功能 — 从相册库选择照片后使用")
-                .into_any_element(),
-            Page::Trash => self
-                .page_placeholder(IconName::Delete, "回收站 — 删除的照片会保存在这里 30 天")
-                .into_any_element(),
+            Page::Rename => self.page_rename(state).into_any_element(),
+            Page::Trash => self.page_trash(state).into_any_element(),
         }
     }
 }
@@ -1243,10 +1380,50 @@ impl AppRoot {
                 }
             });
 
+        // 选中照片后的批量操作按钮（重命名前往重命名页确认模板，删除直接移入回收站）
+        let app_rename = app.clone();
+        let rename_nav = Button::new("nav-rename")
+            .outline()
+            .icon(IconName::CaseSensitive)
+            .label("重命名")
+            .on_click(move |_ev, _w, cx| {
+                app_rename.update(cx, |s, cx| {
+                    s.page = Page::Rename;
+                    cx.notify();
+                });
+            });
+        let app_del = app.clone();
+        let has_selection = !state.selected.is_empty();
+        let delete_btn = Button::new("batch-delete")
+            .outline()
+            .icon(IconName::Delete)
+            .label(if has_selection { "删除到回收站" } else { "删除" })
+            .text_color(col(if has_selection { DANGER } else { TEXT_SECONDARY }))
+            .on_click(move |_ev, _w, cx| {
+                app_del.update(cx, |s, _cx| s.batch_trash());
+            });
+
+        // 批量操作状态提示（删除/重命名/撤销结果）
+        let ops_status = if state.ops_status.is_empty() {
+            div().id("ops-status-none")
+        } else {
+            div()
+                .id("ops-status")
+                .mb(px(8.))
+                .px(px(12.))
+                .py(px(6.))
+                .rounded_md()
+                .bg(col(GOLD_PALE))
+                .text_size(px(12.))
+                .text_color(col(PRIMARY))
+                .child(state.ops_status.clone())
+        };
+
         div()
             .id("page-library")
             .flex().flex_col()
             .child(status_bar)
+            .child(ops_status)
             .child(
                 div()
                     .id("library-header")
@@ -1258,8 +1435,8 @@ impl AppRoot {
                     .child(
                         div().id("library-actions").flex().flex_row().gap(px(8.)).children(vec![
                             scan_btn,
-                            header_btn(IconName::CaseSensitive, "重命名", TEXT_SECONDARY),
-                            header_btn(IconName::FolderOpen, "归档", TEXT_SECONDARY),
+                            rename_nav,
+                            delete_btn,
                         ]),
                     ),
             )
@@ -1275,26 +1452,252 @@ impl AppRoot {
             )
     }
 
-    fn page_placeholder(&self, icon: IconName, text: &'static str) -> impl IntoElement + 'static {
-        div()
-            .id("page-placeholder")
-            .flex_1()
-            .items_center()
-            .justify_center()
-            .flex().flex_col()
-            .gap(px(10.))
-            .text_color(col(TEXT_LIGHT))
-            .child(Icon::new(icon).size(px(48.)).text_color(col(BORDER_LIGHT)))
-            .child(div().text_size(px(15.)).child(text.to_owned()))
-    }
-}
+    // ===== 重命名页（M3） =====
+    fn page_rename(&self, state: &AppState) -> impl IntoElement + 'static {
+        let app = &self.app;
+        let ids = state.selected_photo_ids();
+        let count = ids.len();
 
-fn header_btn(icon: IconName, label: &'static str, color: u32) -> Button {
-    Button::new(label)
-        .outline()
-        .icon(icon)
-        .label(label)
-        .text_color(col(color))
+        // 预设模板（点击即选用，避免文本输入框在 dialog 中的 window 生命周期复杂度）
+        let presets: Vec<(&str, &str, &str)> = vec![
+            ("{前缀}_{日期}_{序号:3}", "前缀+日期+序号", "日本_20240815_001.jpg"),
+            ("{前缀}_{序号:3}", "前缀+序号", "日本_001.jpg"),
+            ("{日期}_{时间}_{序号:3}", "日期+时间+序号", "20240815_094523_001.jpg"),
+            ("{前缀}_{地点}_{序号:3}", "前缀+地点+序号", "日本_富士山_001.jpg"),
+            ("{前缀}_{标签}_{序号:3}", "前缀+标签+序号", "日本_旅行_001.jpg"),
+        ];
+
+        // 实时预览：用当前 pattern/prefix 计算前 5 条
+        let preview_items: Vec<(String, String)> = if count > 0 {
+            crate::core::db::open(&state.paths.db_path)
+                .ok()
+                .and_then(|conn| {
+                    ops_rename::preview(&conn, &ids, &state.rename_pattern, &state.rename_prefix, 5).ok()
+                })
+                .map(|pv| {
+                    pv.items
+                        .into_iter()
+                        .map(|it| (it.old_name, it.new_name))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let preset_cards = presets
+            .into_iter()
+            .enumerate()
+            .map(|(i, (pattern, label, example))| {
+                let app = app.clone();
+                let pat = pattern.to_string();
+                let active = state.rename_pattern == pattern;
+                div()
+                    .id(("rename-preset", i))
+                    .flex_1()
+                    .bg(col(if active { GOLD_PALE } else { BG_WARM }))
+                    .rounded_md()
+                    .px(px(12.))
+                    .py(px(10.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(col(if active { GOLD } else { BORDER_LIGHT }))
+                    .on_click(move |_ev, _w, cx| {
+                        let pat = pat.clone();
+                        app.update(cx, |s, cx| {
+                            s.rename_pattern = pat;
+                            cx.notify();
+                        });
+                    })
+                    .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).child(label.to_string()))
+                    .child(div().text_size(px(10.)).mt(px(4.)).text_color(col(TEXT_LIGHT)).child(example.to_string()))
+            })
+            .collect::<Vec<_>>();
+
+        let preview_rows = preview_items
+            .into_iter()
+            .enumerate()
+            .map(|(i, (old, new))| {
+                div()
+                    .id(("rename-preview", i))
+                    .flex().flex_row().items_center()
+                    .gap(px(10.))
+                    .px(px(12.)).py(px(7.))
+                    .bg(col(BG_WARM))
+                    .rounded_md()
+                    .text_size(px(12.))
+                    .child(div().w(px(260.)).text_color(col(TEXT_SECONDARY)).child(old))
+                    .child(Icon::new(IconName::ArrowRight).size_3().text_color(col(GOLD)))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(new))
+            })
+            .collect::<Vec<_>>();
+
+        let app_exec = app.clone();
+        let exec_btn = Button::new("rename-exec")
+            .primary()
+            .icon(IconName::CaseSensitive)
+            .label(format!("执行重命名（{} 张）", count))
+            .on_click(move |_ev, _w, cx| {
+                app_exec.update(cx, |s, _cx| s.batch_rename());
+            });
+        let app_undo = app.clone();
+        let undo_btn = Button::new("rename-undo")
+            .outline()
+            .icon(IconName::Undo)
+            .label("撤销上次重命名")
+            .on_click(move |_ev, _w, cx| {
+                app_undo.update(cx, |s, _cx| s.undo_rename());
+            });
+
+        let status = if state.ops_status.is_empty() {
+            format!("从相册库 Ctrl+点按选择照片后，这里会显示重命名预览。当前选中 {} 张。", count)
+        } else {
+            state.ops_status.clone()
+        };
+
+        div()
+            .id("page-rename")
+            .flex().flex_col()
+            .child(page_title("✏️ 批量重命名", "选择命名模板，预览后执行 · 可一次撤销"))
+            .child(div().id("rename-status").text_size(px(12.)).text_color(col(TEXT_SECONDARY))
+                .my(px(10.)).child(status))
+            .child(div().id("rename-presets").flex().flex_row().gap(px(10.)).mb(px(16.)).children(preset_cards))
+            .child(
+                div().id("rename-preview-panel").flex_1().bg(col(BG_WHITE)).rounded_lg()
+                    .p(px(18.)).shadow_sm().flex().flex_col()
+                    .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD)
+                        .text_color(col(TEXT_SECONDARY)).mb(px(10.)).child("📐 命名预览（前 5 张）"))
+                    .child(if preview_rows.is_empty() {
+                        div().id("rename-preview-empty").flex_1().flex().flex_col()
+                            .items_center().justify_center().gap(px(8.))
+                            .child(Icon::new(IconName::CaseSensitive).size(px(40.)).text_color(col(BORDER_LIGHT)))
+                            .child(div().text_size(px(13.)).text_color(col(TEXT_LIGHT))
+                                .child("请先在相册库选择要重命名的照片"))
+                            .into_any_element()
+                    } else {
+                        div().id("rename-preview-list").flex().flex_col().gap(px(6.))
+                            .children(preview_rows).into_any_element()
+                    })
+            )
+            .child(div().id("rename-actions").flex().flex_row().gap(px(10.)).mt(px(14.))
+                .justify_end()
+                .child(undo_btn)
+                .child(exec_btn))
+    }
+
+    // ===== 回收站页（M3） =====
+    fn page_trash(&self, state: &AppState) -> impl IntoElement + 'static {
+        let app = &self.app;
+        let ops = &state.ops_data;
+
+        let rows = ops
+            .trash
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let app = app.clone();
+                let id = item.id;
+                let name = item.photo.file_name.clone();
+                let size = item.photo.file_size_label();
+                let age_days = (crate::core::db::now_millis() - item.trashed_at) / (24 * 60 * 60 * 1000);
+                div()
+                    .id(("trash-row", i))
+                    .flex().flex_row().items_center().gap(px(12.))
+                    .px(px(14.)).py(px(10.))
+                    .bg(col(BG_WARM)).rounded_md()
+                    .child(Icon::new(IconName::File).size_4().text_color(col(TEXT_LIGHT)))
+                    .child(div().w(px(300.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).child(name))
+                    .child(div().text_size(px(11.)).text_color(col(TEXT_SECONDARY)).child(size))
+                    .child(div().text_size(px(11.)).text_color(col(TEXT_LIGHT)).child(format!("{} 天前", age_days)))
+                    .child(
+                        Button::new(("trash-restore", i)).outline().icon(IconName::Undo).label("恢复")
+                            .on_click(move |_ev, _w, cx| {
+                                let id = id;
+                                app.update(cx, move |s, cx| {
+                                    let paths = s.paths.clone();
+                                    let result = crate::core::db::open(&paths.db_path)
+                                        .map_err(anyhow::Error::from)
+                                        .and_then(|conn| ops_trash::restore_items(&paths, &conn, &[id]));
+                                    match result {
+                                        Ok(_) => {
+                                            s.ops_status = "已恢复到原路径".to_string();
+                                            s.reload_all();
+                                        }
+                                        Err(e) => s.ops_status = format!("恢复失败：{e}"),
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        let app_empty = app.clone();
+        let empty_btn = Button::new("trash-empty").outline().icon(IconName::Delete)
+            .label("清空回收站").text_color(col(DANGER))
+            .on_click(move |_ev, _w, cx| {
+                app_empty.update(cx, |s, cx| {
+                    let paths = s.paths.clone();
+                    let result = crate::core::db::open(&paths.db_path)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|conn| ops_trash::empty_trash(&paths, &conn));
+                    match result {
+                        Ok(n) => s.ops_status = format!("已永久清空回收站 {} 张", n),
+                        Err(e) => s.ops_status = format!("清空失败：{e}"),
+                    }
+                    s.reload_all();
+                    cx.notify();
+                });
+            });
+        let app_purge = app.clone();
+        let purge_btn = Button::new("trash-purge").ghost().icon(IconName::Redo).label("清理 30 天前")
+            .on_click(move |_ev, _w, cx| {
+                app_purge.update(cx, |s, cx| {
+                    let paths = s.paths.clone();
+                    let result = crate::core::db::open(&paths.db_path)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|conn| ops_trash::purge_expired(&conn, 30));
+                    match result {
+                        Ok(n) => s.ops_status = format!("已清理 {} 天前项目 {} 张", 30, n),
+                        Err(e) => s.ops_status = format!("清理失败：{e}"),
+                    }
+                    s.reload_all();
+                    cx.notify();
+                });
+            });
+        let app_undo = app.clone();
+        let undo_btn = Button::new("trash-undo").ghost().icon(IconName::Undo).label("撤销上次删除")
+            .on_click(move |_ev, _w, cx| app_undo.update(cx, |s, _cx| s.undo_trash()));
+
+        let status = if state.ops_status.is_empty() {
+            format!("回收站中的文件保留 30 天，之后可手动清理；恢复会放回原路径。当前 {} 张 · {}", ops.trash_count, ops.size_label())
+        } else {
+            state.ops_status.clone()
+        };
+
+        div()
+            .id("page-trash")
+            .flex().flex_col()
+            .child(page_title("🗑️ 回收站", "删除的照片保存在这里 · 不会永久丢失"))
+            .child(div().id("trash-status").text_size(px(12.)).text_color(col(TEXT_SECONDARY))
+                .my(px(10.)).child(status))
+            .child(
+                div().id("trash-list").flex_1().bg(col(BG_WHITE)).rounded_lg()
+                    .p(px(18.)).shadow_sm().flex().flex_col().gap(px(8.))
+                    .child(if rows.is_empty() {
+                        div().id("trash-empty").flex_1().flex().flex_col().items_center()
+                            .justify_center().gap(px(8.))
+                            .child(Icon::new(IconName::Delete).size(px(40.)).text_color(col(BORDER_LIGHT)))
+                            .child(div().text_size(px(13.)).text_color(col(TEXT_LIGHT)).child("回收站是空的"))
+                            .into_any_element()
+                    } else {
+                        div().id("trash-rows").flex().flex_col().gap(px(6.)).children(rows).into_any_element()
+                    })
+            )
+            .child(div().id("trash-actions").flex().flex_row().gap(px(10.)).mt(px(14.)).justify_end()
+                .child(undo_btn).child(purge_btn).child(empty_btn))
+    }
+
 }
 
 /// 根据路径稳定生成色相，保证同一照片每次显示相同占位色。

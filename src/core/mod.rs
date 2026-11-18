@@ -6,5 +6,6 @@ pub mod analyze;
 pub mod config;
 pub mod db;
 pub mod model;
+pub mod ops;
 pub mod scanner;
 pub mod thumbnail;
