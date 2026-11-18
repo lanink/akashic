@@ -12,6 +12,7 @@ use gpui_component::WindowExt;
 
 use crate::core::analyze::{AnalyzeProgress, AnalyzeReport};
 use crate::core::config::Paths;
+use crate::core::ops::archive::{self as ops_archive, ArchiveMode, ArchivePlan, ArchiveRule, ArchiveTreeNode};
 use crate::core::ops::{rename as ops_rename, trash as ops_trash};
 use crate::core::model::{Photo, ScanProgress, ScanStats};
 use crate::ui::analyze::AnalyzeData;
@@ -49,6 +50,7 @@ enum Page {
     Organize,
     Library,
     Rename,
+    Archive,
     Trash,
 }
 
@@ -93,6 +95,14 @@ pub struct AppState {
     /// 最近一次可撤销的重命名/删除操作 id
     last_rename_op: Option<i64>,
     last_trash_op: Option<i64>,
+    /// M4 智能归档配置与预览
+    archive_dest: PathBuf,
+    archive_rule: ArchiveRule,
+    archive_mode: ArchiveMode,
+    /// true=全部可见照片，false=仅相册库选中照片
+    archive_scope_all: bool,
+    archive_plan: Option<ArchivePlan>,
+    last_archive_op: Option<i64>,
 }
 
 /// 整理页的 4 个分析工具。
@@ -109,15 +119,27 @@ impl AppState {
         cx.new(|_| {
             // 启动时尝试从已有索引加载；失败则用空快照（不影响 UI 启动）
             let db_path = paths.db_path.clone();
-            let (data, analyze_data, ops_data) = match crate::core::db::open(&db_path) {
-                Ok(conn) => (
-                    LibraryData::reload(&conn).unwrap_or_default(),
-                    AnalyzeData::reload(&conn).unwrap_or_default(),
-                    OpsData::reload(&conn).unwrap_or_default(),
-                ),
-                Err(_) => (LibraryData::default(), AnalyzeData::default(), OpsData::default()),
-            };
-            Self {
+            let mut data = LibraryData::default();
+            let mut analyze_data = AnalyzeData::default();
+            let mut ops_data = OpsData::default();
+            let mut archive_dest = PathBuf::new();
+            let mut archive_rule = ArchiveRule::default();
+            let mut archive_mode = ArchiveMode::default();
+            if let Ok(conn) = crate::core::db::open(&db_path) {
+                data = LibraryData::reload(&conn).unwrap_or_default();
+                analyze_data = AnalyzeData::reload(&conn).unwrap_or_default();
+                ops_data = OpsData::reload(&conn).unwrap_or_default();
+                if let Some(v) = crate::core::db::get_setting(&conn, "archive.dest").ok().flatten() {
+                    archive_dest = PathBuf::from(v);
+                }
+                if let Some(v) = crate::core::db::get_setting(&conn, "archive.rule").ok().flatten() {
+                    archive_rule = ArchiveRule::from_str(&v);
+                }
+                if let Some(v) = crate::core::db::get_setting(&conn, "archive.mode").ok().flatten() {
+                    archive_mode = ArchiveMode::from_str(&v);
+                }
+            }
+            let mut s = Self {
                 page: Page::Library,
                 paths,
                 data,
@@ -138,7 +160,15 @@ impl AppState {
                 rename_prefix: String::new(),
                 last_rename_op: None,
                 last_trash_op: None,
-            }
+                archive_dest,
+                archive_rule,
+                archive_mode,
+                archive_scope_all: true,
+                archive_plan: None,
+                last_archive_op: None,
+            };
+            s.refresh_archive_plan();
+            s
         })
     }
 
@@ -247,6 +277,134 @@ impl AppState {
                 self.reload_all();
             }
             Err(e) => self.ops_status = format!("撤销失败：{e}"),
+        }
+    }
+
+    /// 当前归档范围对应的照片 id。
+    fn archive_ids(&self) -> Vec<i64> {
+        if self.archive_scope_all {
+            self.data.visible_photos().iter().map(|p| p.id).collect()
+        } else {
+            self.selected_photo_ids()
+        }
+    }
+
+    /// 持久化归档配置到 settings 表（个人本地，重启后保留）。
+    fn persist_archive_settings(&self) {
+        if let Ok(conn) = crate::core::db::open(&self.paths.db_path) {
+            let _ = crate::core::db::set_setting(&conn, "archive.rule", self.archive_rule.as_str());
+            let _ = crate::core::db::set_setting(&conn, "archive.mode", self.archive_mode.as_str());
+            if !self.archive_dest.as_os_str().is_empty() {
+                let _ = crate::core::db::set_setting(
+                    &conn,
+                    "archive.dest",
+                    &self.archive_dest.to_string_lossy(),
+                );
+            }
+        }
+    }
+
+    /// 重新生成归档目录树预览（只读，不落盘）。
+    /// 未显式选择目标目录时，默认落到「扫描根目录的同级 / 归档」，避免归档目录被后续扫描重复索引。
+    fn refresh_archive_plan(&mut self) {
+        let ids = self.archive_ids();
+        let rule = self.archive_rule;
+        let mode = self.archive_mode;
+        let db_path = self.paths.db_path.clone();
+        let data_dir = self.paths.data_dir.clone();
+        let chosen = self.archive_dest.clone();
+        let result = crate::core::db::open(&db_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| {
+                let dest = if !chosen.as_os_str().is_empty() {
+                    chosen.clone()
+                } else {
+                    crate::core::db::list_scan_roots(&conn)
+                        .ok()
+                        .and_then(|roots| {
+                            roots.first().map(|r| {
+                                let base = r
+                                    .path
+                                    .parent()
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_else(|| r.path.clone());
+                                base.join("归档")
+                            })
+                        })
+                        .unwrap_or_else(|| data_dir.join("归档"))
+                };
+                ops_archive::plan(&conn, &ids, rule, mode, &dest)
+            });
+        match result {
+            Ok(p) => self.archive_plan = Some(p),
+            Err(e) => {
+                self.archive_plan = None;
+                self.ops_status = format!("生成归档预览失败：{e}");
+            }
+        }
+    }
+
+    /// 用原生对话框选择归档目标目录。
+    fn choose_archive_dest(&mut self) {
+        if let Some(folder) = rfd::FileDialog::new()
+            .set_title("选择归档目标目录")
+            .pick_folder()
+        {
+            self.archive_dest = folder.to_path_buf();
+            self.persist_archive_settings();
+            self.refresh_archive_plan();
+            self.ops_status = format!("归档目标：{}", self.archive_dest.display());
+        }
+    }
+
+    /// 执行归档：用刚刷新的计划落盘（保证目录树预览与实际一致）。
+    fn execute_archive(&mut self) {
+        self.refresh_archive_plan();
+        let Some(plan) = self.archive_plan.clone() else {
+            self.ops_status = "无法生成归档计划，请先建立索引".to_string();
+            return;
+        };
+        if plan.items.is_empty() {
+            self.ops_status = "当前范围没有可归档的照片".to_string();
+            return;
+        }
+        let result = crate::core::db::open(&self.paths.db_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| ops_archive::execute(&conn, &plan));
+        match result {
+            Ok(r) => {
+                self.last_archive_op = Some(r.op_id);
+                self.ops_status = format!(
+                    "已{}归档 {} 张到 {} · 可点「撤销上次归档」恢复",
+                    if plan.mode == ArchiveMode::Move { "移动" } else { "复制" },
+                    r.count,
+                    r.dest_root.display()
+                );
+                self.selected.clear();
+                self.reload_all();
+                self.refresh_archive_plan();
+            }
+            Err(e) => self.ops_status = format!("归档失败：{e}"),
+        }
+    }
+
+    /// 撤销最近一次归档。
+    fn undo_archive(&mut self) {
+        let Some(op_id) = self.last_archive_op else {
+            self.ops_status = "没有可撤销的归档操作".to_string();
+            return;
+        };
+        let result = crate::core::db::open(&self.paths.db_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|conn| ops_archive::undo(&conn, op_id));
+        match result {
+            Ok(n) => {
+                self.ops_status = format!("已撤销归档，处理 {n} 张");
+                self.last_archive_op = None;
+                self.reload_all();
+                self.refresh_archive_plan();
+            }
+            Err(e) => self.ops_status = format!("撤销归档失败：{e}"),
         }
     }
 
@@ -580,6 +738,11 @@ impl AppRoot {
     /// 深色侧边导航栏
     fn sidebar(&self, state: &AppState) -> impl IntoElement + 'static {
         let app = &self.app;
+        // 待处理项总数（替换原硬编码的模拟徽标 12）
+        let analyze_total = state.analyze_data.groups.len()
+            + state.analyze_data.blurry.len()
+            + state.analyze_data.screenshots.len()
+            + state.analyze_data.large.len();
         let nav = |page: Page, icon: IconName, label: &'static str, badge: Option<String>| {
             let active = state.page == page;
             let app = app.clone();
@@ -648,7 +811,12 @@ impl AppRoot {
             .bg(col(BG_SIDEBAR))
             .pt(px(4.))
             .child(nav(Page::Home, IconName::LayoutDashboard, "首页", None))
-            .child(nav(Page::Organize, IconName::Settings2, "智能整理", Some("12".to_string())))
+            .child(nav(
+                Page::Organize,
+                IconName::Settings2,
+                "智能整理",
+                Some(format!("{}", analyze_total)),
+            ))
             .child(nav(
                 Page::Library,
                 IconName::GalleryVerticalEnd,
@@ -656,6 +824,7 @@ impl AppRoot {
                 Some(format!("{}", state.data.total_count)),
             ))
             .child(nav(Page::Rename, IconName::CaseSensitive, "重命名", None))
+            .child(nav(Page::Archive, IconName::FolderOpen, "智能归档", None))
             .child(nav(
                 Page::Trash,
                 IconName::Delete,
@@ -695,6 +864,7 @@ impl AppRoot {
             Page::Organize => self.page_organize(state).into_any_element(),
             Page::Library => self.page_library(state).into_any_element(),
             Page::Rename => self.page_rename(state).into_any_element(),
+            Page::Archive => self.page_archive(state).into_any_element(),
             Page::Trash => self.page_trash(state).into_any_element(),
         }
     }
@@ -843,16 +1013,16 @@ impl AppRoot {
     fn page_organize(&self, state: &AppState) -> impl IntoElement + 'static {
         let app = &self.app;
         let badges = state.analyze_data.badges();
-        // 前 4 个为 M2 已实现的分析工具，可点击进入结果列表；后 2 个属后续里程碑。
+        // 前 4 个为 M2 分析工具（进入结果列表）；后 2 个跳转到 M3/M4 的真实页面。
         let tools = vec![
-            (IconName::Copy, "相似照片", "连拍 & 重复角度", badges[0].clone(), false, Some(OrganizeTool::Similar)),
-            (IconName::EyeOff, "模糊检测", "手抖 / 失焦", badges[1].clone(), false, Some(OrganizeTool::Blurry)),
-            (IconName::Frame, "截图筛选", "屏幕录制 · 截屏", badges[2].clone(), false, Some(OrganizeTool::Screenshot)),
-            (IconName::File, "大文件", "按大小排序", badges[3].clone(), false, Some(OrganizeTool::Large)),
-            (IconName::CaseSensitive, "智能重命名", "统一命名风格", "M3".to_string(), true, None),
-            (IconName::FolderOpen, "智能归档", "自动归入目录", "M4".to_string(), true, None),
+            (IconName::Copy, "相似照片", "连拍 & 重复角度", badges[0].clone(), false, Some(OrganizeTool::Similar), None),
+            (IconName::EyeOff, "模糊检测", "手抖 / 失焦", badges[1].clone(), false, Some(OrganizeTool::Blurry), None),
+            (IconName::Frame, "截图筛选", "屏幕录制 · 截屏", badges[2].clone(), false, Some(OrganizeTool::Screenshot), None),
+            (IconName::File, "大文件", "按大小排序", badges[3].clone(), false, Some(OrganizeTool::Large), None),
+            (IconName::CaseSensitive, "智能重命名", "统一命名风格", "已就绪".to_string(), false, None, Some(Page::Rename)),
+            (IconName::FolderOpen, "智能归档", "自动归入目录", "已就绪".to_string(), false, None, Some(Page::Archive)),
         ];
-        let tool_cards = tools.into_iter().enumerate().map(|(ti, (icon, name, desc, badge, star, tool))| {
+        let tool_cards = tools.into_iter().enumerate().map(|(ti, (icon, name, desc, badge, star, tool, page))| {
             let app = app.clone();
             div()
                 .id(("tool", ti))
@@ -867,7 +1037,12 @@ impl AppRoot {
                 .items_center()
                 .gap(px(14.))
                 .on_click(move |_ev, _w, cx| {
-                    if let Some(t) = tool {
+                    if let Some(p) = page {
+                        app.update(cx, |s, cx| {
+                            s.page = p;
+                            cx.notify();
+                        });
+                    } else if let Some(t) = tool {
                         app.update(cx, |s, cx| {
                             s.active_tool = Some(t);
                             cx.notify();
@@ -1563,6 +1738,373 @@ impl AppRoot {
                 .child(exec_btn))
     }
 
+    // ===== 智能归档页（M4） =====
+    fn page_archive(&self, state: &AppState) -> impl IntoElement + 'static {
+        let app = &self.app;
+        let plan = state.archive_plan.clone();
+        let (total_files, total_bytes, conflict_count, dest_label, rule_label, mode_label) =
+            match &plan {
+                Some(p) => (
+                    p.total_files,
+                    p.total_bytes,
+                    p.conflict_count,
+                    p.dest_root.to_string_lossy().to_string(),
+                    p.rule.label().to_string(),
+                    p.mode.label().to_string(),
+                ),
+                None => (
+                    0usize,
+                    0i64,
+                    0usize,
+                    "（未生成预览）".to_string(),
+                    state.archive_rule.label().to_string(),
+                    state.archive_mode.label().to_string(),
+                ),
+            };
+
+        // ① 规则预设
+        let rule_cards = ArchiveRule::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| {
+                let app = app.clone();
+                let r = *rule;
+                let active = state.archive_rule == r;
+                div()
+                    .id(("arc-rule", i))
+                    .flex_1()
+                    .bg(col(if active { GOLD_PALE } else { BG_WARM }))
+                    .rounded_md()
+                    .px(px(12.))
+                    .py(px(10.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(col(if active { GOLD } else { BORDER_LIGHT }))
+                    .on_click(move |_ev, _w, cx| {
+                        app.update(cx, |s, cx| {
+                            s.archive_rule = r;
+                            s.persist_archive_settings();
+                            s.refresh_archive_plan();
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(r.label().to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .mt(px(4.))
+                            .text_color(col(TEXT_LIGHT))
+                            .child(r.example().to_string()),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        // ② 模式（移动 / 复制）
+        let app_move = app.clone();
+        let move_btn = Button::new("arc-mode-move")
+            .when(state.archive_mode == ArchiveMode::Move, |b| b.primary())
+            .when(state.archive_mode != ArchiveMode::Move, |b| b.outline())
+            .label("移动（整理原目录）")
+            .on_click(move |_ev, _w, cx| {
+                app_move.update(cx, |s, cx| {
+                    s.archive_mode = ArchiveMode::Move;
+                    s.persist_archive_settings();
+                    s.refresh_archive_plan();
+                    cx.notify();
+                });
+            });
+        let app_copy = app.clone();
+        let copy_btn = Button::new("arc-mode-copy")
+            .when(state.archive_mode == ArchiveMode::Copy, |b| b.primary())
+            .when(state.archive_mode != ArchiveMode::Copy, |b| b.outline())
+            .label("复制（保留原文件）")
+            .on_click(move |_ev, _w, cx| {
+                app_copy.update(cx, |s, cx| {
+                    s.archive_mode = ArchiveMode::Copy;
+                    s.persist_archive_settings();
+                    s.refresh_archive_plan();
+                    cx.notify();
+                });
+            });
+
+        // ③ 范围（全部可见 / 仅选中）
+        let scope_text = if state.archive_scope_all {
+            format!("全部 {} 张", state.visible_count())
+        } else {
+            format!("选中 {} 张", state.selected_photo_ids().len())
+        };
+        let app_scope = app.clone();
+        let scope_btn = Button::new("arc-scope")
+            .outline()
+            .label(scope_text)
+            .on_click(move |_ev, _w, cx| {
+                app_scope.update(cx, |s, cx| {
+                    s.archive_scope_all = !s.archive_scope_all;
+                    s.refresh_archive_plan();
+                    cx.notify();
+                });
+            });
+
+        // ④ 目标目录（原生对话框）
+        let app_dest = app.clone();
+        let dest_btn = Button::new("arc-choose-dest")
+            .outline()
+            .icon(IconName::FolderOpen)
+            .label("选择归档目标目录")
+            .on_click(move |_ev, _w, cx| {
+                app_dest.update(cx, |s, cx| {
+                    s.choose_archive_dest();
+                    cx.notify();
+                });
+            });
+
+        // 完整目录树预览：展平成 (深度, 节点) 列表，缩进体现层级
+        let mut flat: Vec<(usize, ArchiveTreeNode)> = Vec::new();
+        if let Some(p) = &plan {
+            for node in &p.tree {
+                flatten_archive_node(node, 0, &mut flat);
+            }
+        }
+        let tree_rows = flat
+            .into_iter()
+            .enumerate()
+            .map(|(i, (depth, node))| {
+                let name = node.name.clone();
+                let count = node.total_count;
+                let size = format!("{:.1} MB", node.total_bytes as f64 / 1024.0 / 1024.0);
+                let sample = node.sample.join("、");
+                div()
+                    .id(("arc-row", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .pl(px(10. + depth as f32 * 18.))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(col(BORDER_LIGHT))
+                    .child(Icon::new(IconName::FolderOpen).size_3().text_color(col(GOLD)))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(col(TEXT_SECONDARY))
+                            .child(format!("{} 张 · {}", count, size)),
+                    )
+                    .child(
+                        div()
+                            .ml_auto()
+                            .text_size(px(10.))
+                            .text_color(col(TEXT_LIGHT))
+                            .child(sample),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        let tree_body: AnyElement = if tree_rows.is_empty() {
+            div()
+                .id("arc-tree-empty")
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .child(Icon::new(IconName::FolderOpen).size(px(40.)).text_color(col(BORDER_LIGHT)))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(col(TEXT_LIGHT))
+                        .child("当前范围没有照片，请先在相册库扫描或调整范围"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("arc-tree-rows")
+                .flex()
+                .flex_col()
+                .children(tree_rows)
+                .into_any_element()
+        };
+
+        let tree_panel = div()
+            .id("arc-tree-panel")
+            .flex_1()
+            .min_h_0()
+            .bg(col(BG_WHITE))
+            .rounded_lg()
+            .p(px(16.))
+            .shadow_sm()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(col(TEXT_SECONDARY))
+                    .mb(px(10.))
+                    .child("🌳 完整目录树预览（与实际落盘一致）"),
+            )
+            .child(div().id("arc-tree-scroll").flex_1().min_h_0().overflow_y_scroll().child(tree_body));
+
+        let stats_panel = div()
+            .id("arc-stats")
+            .w(px(250.))
+            .flex_none()
+            .bg(col(BG_WHITE))
+            .rounded_lg()
+            .p(px(16.))
+            .shadow_sm()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("📊 本次归档"),
+            )
+            .child(archive_stat_row("待归档", format!("{} 张", total_files)))
+            .child(archive_stat_row(
+                "占用空间",
+                format!("{:.1} MB", total_bytes as f64 / 1024.0 / 1024.0),
+            ))
+            .child(archive_stat_row("冲突改名", format!("{} 张", conflict_count)))
+            .child(archive_stat_row("目录层级", rule_label.clone()))
+            .child(archive_stat_row("执行方式", mode_label.clone()))
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(col(TEXT_LIGHT))
+                    .child(format!("目标：{}", dest_label)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(col(TEXT_LIGHT))
+                    .child("复制模式会保留源文件并把副本加入索引；撤销只删除本次副本。"),
+            );
+
+        let app_refresh = app.clone();
+        let refresh_btn = Button::new("arc-refresh")
+            .outline()
+            .icon(IconName::Redo)
+            .label("刷新预览")
+            .on_click(move |_ev, _w, cx| {
+                app_refresh.update(cx, |s, cx| {
+                    s.refresh_archive_plan();
+                    cx.notify();
+                });
+            });
+        let app_undo = app.clone();
+        let undo_btn = Button::new("arc-undo")
+            .outline()
+            .icon(IconName::Undo)
+            .label("撤销上次归档")
+            .on_click(move |_ev, _w, cx| {
+                app_undo.update(cx, |s, cx| {
+                    s.undo_archive();
+                    cx.notify();
+                });
+            });
+        let app_exec = app.clone();
+        let exec_btn = Button::new("arc-exec")
+            .primary()
+            .icon(IconName::FolderOpen)
+            .label(format!("执行归档（{} 张）", total_files))
+            .on_click(move |_ev, _w, cx| {
+                app_exec.update(cx, |s, cx| {
+                    s.execute_archive();
+                    cx.notify();
+                });
+            });
+
+        let status = if state.ops_status.is_empty() {
+            format!("规则：{} · 模式：{} · 目录树预览只读，确认后再执行", rule_label, mode_label)
+        } else {
+            state.ops_status.clone()
+        };
+
+        div()
+            .id("page-archive")
+            .flex()
+            .flex_col()
+            .child(page_title("🗂️ 智能归档", "按规则生成目录树 · 预览后执行 · 可一次撤销"))
+            .child(
+                div()
+                    .id("arc-status")
+                    .text_size(px(12.))
+                    .text_color(col(TEXT_SECONDARY))
+                    .my(px(10.))
+                    .child(status),
+            )
+            .child(
+                div()
+                    .id("arc-config")
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .mb(px(14.))
+                    .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).child("① 归档规则"))
+                    .child(div().flex().flex_row().gap(px(10.)).children(rule_cards))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().text_size(px(12.)).child("② 模式"))
+                            .child(move_btn)
+                            .child(copy_btn)
+                            .child(div().text_size(px(12.)).ml(px(6.)).child("③ 范围"))
+                            .child(scope_btn),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().text_size(px(12.)).child("④ 目标目录"))
+                            .child(dest_btn)
+                            .child(div().text_size(px(10.)).text_color(col(TEXT_LIGHT)).child(dest_label.clone())),
+                    ),
+            )
+            .child(
+                div()
+                    .id("arc-main")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_row()
+                    .gap(px(14.))
+                    .child(tree_panel)
+                    .child(stats_panel),
+            )
+            .child(
+                div()
+                    .id("arc-actions")
+                    .flex()
+                    .flex_row()
+                    .gap(px(10.))
+                    .mt(px(14.))
+                    .justify_end()
+                    .child(refresh_btn)
+                    .child(undo_btn)
+                    .child(exec_btn),
+            )
+    }
+
     // ===== 回收站页（M3） =====
     fn page_trash(&self, state: &AppState) -> impl IntoElement + 'static {
         let app = &self.app;
@@ -1691,6 +2233,30 @@ impl AppRoot {
                 .child(undo_btn).child(purge_btn).child(empty_btn))
     }
 
+}
+
+/// 把归档目录树展平成 (深度, 节点) 列表，供 UI 按层级缩进渲染。
+fn flatten_archive_node(
+    node: &ArchiveTreeNode,
+    depth: usize,
+    out: &mut Vec<(usize, ArchiveTreeNode)>,
+) {
+    out.push((depth, node.clone()));
+    for child in &node.children {
+        flatten_archive_node(child, depth + 1, out);
+    }
+}
+
+/// 归档统计面板的一行。
+fn archive_stat_row(label: &'static str, value: String) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .justify_between()
+        .text_size(px(12.))
+        .child(div().text_color(col(TEXT_SECONDARY)).child(label))
+        .child(div().font_weight(FontWeight::SEMIBOLD).child(value))
+        .into_any_element()
 }
 
 /// 根据路径稳定生成色相，保证同一照片每次显示相同占位色。

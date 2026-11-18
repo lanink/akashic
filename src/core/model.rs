@@ -140,6 +140,10 @@ pub enum OpKind {
     EmptyTrash,
     /// 清理超过保留期的回收站项目
     Purge,
+    /// M4 智能归档 · 移动模式
+    ArchiveMove,
+    /// M4 智能归档 · 复制模式
+    ArchiveCopy,
 }
 
 impl OpKind {
@@ -150,6 +154,8 @@ impl OpKind {
             OpKind::Rename => "rename",
             OpKind::EmptyTrash => "empty_trash",
             OpKind::Purge => "purge",
+            OpKind::ArchiveMove => "archive_move",
+            OpKind::ArchiveCopy => "archive_copy",
         }
     }
 
@@ -159,6 +165,8 @@ impl OpKind {
             "rename" => OpKind::Rename,
             "empty_trash" => OpKind::EmptyTrash,
             "purge" => OpKind::Purge,
+            "archive_move" => OpKind::ArchiveMove,
+            "archive_copy" => OpKind::ArchiveCopy,
             _ => OpKind::Trash,
         }
     }

@@ -763,6 +763,29 @@ pub fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+// ===== settings（M4 归档配置持久化） =====
+
+/// 读取一项设置。
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .context("读取设置失败")
+}
+
+/// 写入（或覆盖）一项设置。
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
