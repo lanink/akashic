@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -8,7 +10,9 @@ use gpui_component::Icon;
 use gpui_component::IconName;
 use gpui_component::WindowExt;
 
-use crate::core::model::{expandable_id, folder_defs, FolderNode, PHOTOS};
+use crate::core::config::Paths;
+use crate::core::model::{ScanProgress, ScanStats};
+use crate::ui::library::LibraryData;
 
 // ===== 设计稿配色（akashic-ds.html） =====
 const PRIMARY: u32 = 0x1A2634; // 深蓝 主色
@@ -55,21 +59,140 @@ fn photo_icon_bg(hue: f32) -> Hsla {
 // ===== 应用全局状态 =====
 pub struct AppState {
     page: Page,
-    active_folder: usize,
-    folder_expanded: Vec<bool>, // 与可展开目录一一对应
-    photo_header: &'static str,
+    /// 本机路径配置
+    paths: Paths,
+    /// 相册库数据快照（titlebar/首页统计也从这里取）
+    data: LibraryData,
+    active_folder_id: Option<String>,
+    folder_expanded: HashSet<String>, // 展开的目录 id 集合
     selected: HashSet<usize>,
+    /// 扫描状态文字
+    scan_status: String,
+    is_scanning: bool,
+    /// 后台扫描进度接收端（Send，可放 Entity）
+    progress_rx: Option<Receiver<ScanProgress>>,
 }
 
 impl AppState {
-    fn new(cx: &mut App) -> Entity<Self> {
-        cx.new(|_| Self {
-            page: Page::Library,
-            active_folder: 0,
-            folder_expanded: vec![true, false], // 2024年展开、2023年收起
-            photo_header: "日本旅行 · 85 张",
-            selected: HashSet::new(),
+    fn new(cx: &mut App, paths: Paths) -> Entity<Self> {
+        cx.new(|_| {
+            // 启动时尝试从已有索引加载；失败则用空快照（不影响 UI 启动）
+            let db_path = paths.db_path.clone();
+            let data = match crate::core::db::open(&db_path) {
+                Ok(conn) => LibraryData::reload(&conn).unwrap_or_default(),
+                Err(_) => LibraryData::default(),
+            };
+            Self {
+                page: Page::Library,
+                paths,
+                data,
+                active_folder_id: None,
+                folder_expanded: HashSet::new(),
+                selected: HashSet::new(),
+                scan_status: String::new(),
+                is_scanning: false,
+                progress_rx: None,
+            }
         })
+    }
+
+    /// 当前可见照片数量（供 UI 显示）。
+    pub fn visible_count(&self) -> usize {
+        self.data.visible_photos().len()
+    }
+
+    /// 启动后台扫描：选择目录 → 后台线程扫描写库 → 进度回传 UI。
+    pub fn start_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if self.is_scanning {
+            return;
+        }
+        self.is_scanning = true;
+        self.scan_status = format!("正在扫描 {} …", root.display());
+
+        let (tx, rx) = std::sync::mpsc::channel::<ScanProgress>();
+        self.progress_rx = Some(rx);
+
+        let paths = self.paths.clone();
+
+        // 后台线程：自己打开 DB 连接执行扫描（Connection 不 Send，不能跨线程共享）
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<ScanStats> {
+                let conn = crate::core::db::open(&paths.db_path)?;
+                crate::core::scanner::scan_root(&paths, &conn, &root, Some(&tx))
+            })();
+            if let Err(e) = result {
+                let _ = tx.send(ScanProgress::Failed { message: e.to_string() });
+            }
+        });
+
+        // UI 侧：定时轮询进度通道，收到 Finished/Failed 后刷新数据快照
+        cx.spawn(async move |entity, app: &mut AsyncApp| {
+            loop {
+                // 每 150ms 轮询一次，避免占满 UI 主线程
+                gpui::background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+
+                // 从实体里取出 receiver 做一次非阻塞接收
+                let got = entity
+                    .update(app, |this: &mut Self, _cx| {
+                        if let Some(rx) = &this.progress_rx {
+                            match rx.try_recv() {
+                                Ok(p) => Some(p),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    Some(ScanProgress::Failed {
+                                        message: "扫描线程意外退出".to_string(),
+                                    })
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .ok()
+                    .flatten();
+
+                if let Some(p) = got {
+                    let mut done = false;
+                    entity
+                        .update(app, |this: &mut Self, cx| {
+                            match p {
+                                ScanProgress::Started { root } => {
+                                    this.scan_status = format!("正在扫描 {} …", root.display());
+                                }
+                                ScanProgress::Scanning { processed } => {
+                                    this.scan_status = format!("正在扫描 … 已处理 {} 张", processed);
+                                }
+                                ScanProgress::Finished { stats } => {
+                                    if let Ok(conn) = crate::core::db::open(&this.paths.db_path) {
+                                        this.data = LibraryData::reload(&conn).unwrap_or_default();
+                                    }
+                                    this.scan_status = format!(
+                                        "扫描完成：新增 {} 张，跳过 {} 张，清理 {} 张，耗时 {} ms",
+                                        stats.photos_added, stats.photos_skipped,
+                                        stats.photos_removed, stats.duration_ms
+                                    );
+                                    this.is_scanning = false;
+                                    this.progress_rx = None;
+                                    done = true;
+                                }
+                                ScanProgress::Failed { message } => {
+                                    this.scan_status = format!("扫描失败：{message}");
+                                    this.is_scanning = false;
+                                    this.progress_rx = None;
+                                    done = true;
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    if done {
+                        break;
+                    }
+                }
+            }
+        }).detach();
     }
 }
 
@@ -173,8 +296,8 @@ impl Render for AppRoot {
 }
 
 /// 供组合根创建初始状态（main.rs 使用）。
-pub fn new_app_state(cx: &mut App) -> Entity<AppState> {
-    AppState::new(cx)
+pub fn new_app_state(cx: &mut App, paths: Paths) -> Entity<AppState> {
+    AppState::new(cx, paths)
 }
 
 fn dot(color: u32) -> impl IntoElement + 'static {
@@ -182,7 +305,7 @@ fn dot(color: u32) -> impl IntoElement + 'static {
 }
 
 // ===== 工具/卡片辅助 =====
-fn page_title(main: &'static str, sub: &'static str) -> impl IntoElement {
+fn page_title(main: impl Into<SharedString>, sub: impl Into<SharedString>) -> impl IntoElement {
     div()
         .id("page-title")
         .flex().flex_row()
@@ -193,13 +316,13 @@ fn page_title(main: &'static str, sub: &'static str) -> impl IntoElement {
                 .text_size(px(20.))
                 .font_weight(FontWeight::BOLD)
                 .text_color(col(TEXT_PRIMARY))
-                .child(main),
+                .child(main.into()),
         )
         .child(
             div()
                 .text_size(px(13.))
                 .text_color(col(TEXT_SECONDARY))
-                .child(sub),
+                .child(sub.into()),
         )
 }
 
@@ -304,14 +427,14 @@ impl AppRoot {
 
     fn render_page(&self, state: &AppState) -> impl IntoElement + 'static {
         match state.page {
-            Page::Home => self.page_home().into_any_element(),
+            Page::Home => self.page_home(state).into_any_element(),
             Page::Organize => self.page_organize().into_any_element(),
             Page::Library => self.page_library(state).into_any_element(),
             Page::Rename => self
                 .page_placeholder(IconName::CaseSensitive, "重命名功能 — 从相册库选择照片后使用")
                 .into_any_element(),
             Page::Trash => self
-                .page_placeholder(IconName::Delete, "回收站共 4 张照片")
+                .page_placeholder(IconName::Delete, "回收站 — 删除的照片会保存在这里 30 天")
                 .into_any_element(),
         }
     }
@@ -319,13 +442,24 @@ impl AppRoot {
 
 impl AppRoot {
     // ===== 首页 =====
-    fn page_home(&self) -> impl IntoElement + 'static {
+    fn page_home(&self, state: &AppState) -> impl IntoElement + 'static {
         let app = &self.app;
-        let stats = vec![
-            ("8,432", "总照片", PRIMARY),
-            ("42.6 GB", "占用空间", PRIMARY),
-            ("~400", "可清理预估", GOLD),
-            ("1,247", "已归档", PRIMARY),
+        // 一次性提取真实统计到 owned 值，避免长时间持有 state 引用造成借用冲突
+        let total = state.data.total_count;
+        let total_bytes = state.data.total_bytes;
+        let root_count = state.data.root_count;
+        let size_text = if total_bytes >= 1024 * 1024 * 1024 {
+            format!("{:.1} GB", total_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else if total_bytes >= 1024 * 1024 {
+            format!("{:.1} MB", total_bytes as f64 / (1024.0 * 1024.0))
+        } else {
+            format!("{} KB", total_bytes / 1024)
+        };
+        let stats: Vec<(String, &'static str, u32)> = vec![
+            (format!("{}", total), "总照片", PRIMARY),
+            (size_text.clone(), "占用空间", PRIMARY),
+            (format!("{}", root_count), "扫描目录", GOLD),
+            (format!("{}", state.data.visible_photos().len()), "当前可见", PRIMARY),
         ];
         let stat_cards = stats.into_iter().enumerate().map(|(si, (v, label, color))| {
             div()
@@ -341,7 +475,7 @@ impl AppRoot {
                         .text_size(px(26.))
                         .font_weight(FontWeight::BOLD)
                         .text_color(col(color))
-                        .child(v.to_owned()),
+                        .child(v.clone()),
                 )
                 .child(
                     div()
@@ -352,12 +486,21 @@ impl AppRoot {
                 )
         });
 
-        let records = vec![
-            ("批量删除", "156 张 · 2.3 GB"),
-            ("重命名", "328 张 · 日本旅行"),
-            ("归档", "203 张 → 三亚旅行"),
-            ("清理截图", "89 张 · 0.6 GB"),
-        ];
+        let records: Vec<(&'static str, String)> = if state.data.loaded {
+            vec![
+                ("索引状态", format!("已建立 · {} 个目录", root_count)),
+                ("照片总数", format!("{} 张", total)),
+                ("占用空间", size_text.clone()),
+                ("最近扫描", if root_count > 0 { "索引已就绪".to_string() } else { "尚未扫描".to_string() }),
+            ]
+        } else {
+            vec![
+                ("索引状态", "尚未建立".to_string()),
+                ("提示", "前往相册库选择目录".to_string()),
+                ("整理工具", "扫描后自动解锁".to_string()),
+                ("隐私", "100% 本地 · 零上传".to_string()),
+            ]
+        };
         let record_rows = records.into_iter().enumerate().map(|(ri, (a, b))| {
             div()
                 .id(("record", ri))
@@ -369,8 +512,8 @@ impl AppRoot {
                 .bg(col(BG_WARM))
                 .rounded_md()
                 .text_size(px(13.))
-                .child(div().text_color(col(TEXT_SECONDARY)).child(a.to_owned()))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(b.to_owned()))
+                .child(div().text_color(col(TEXT_SECONDARY)).child(a))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(b))
         });
 
         let app2 = app.clone();
@@ -396,7 +539,7 @@ impl AppRoot {
                     .justify_between()
                     .items_center()
                     .mb(px(16.))
-                    .child(page_title("📊 相册概览", "上次整理：昨天 · 清理了 156 张"))
+                    .child(page_title("📊 相册概览", subtitle_for_home(state)))
                     .child(organize_btn),
             )
             .child(
@@ -581,6 +724,8 @@ impl AppRoot {
     // ===== 相册库页 =====
     fn page_library(&self, state: &AppState) -> impl IntoElement + 'static {
         let app = &self.app;
+
+        // 目录树面板（真实数据）
         let tree_panel = div()
             .id("tree-panel")
             .w(px(220.))
@@ -591,21 +736,26 @@ impl AppRoot {
             .bg(col(BG_WHITE))
             .rounded_lg()
             .shadow_sm()
-            .child(render_folder_tree(&folder_defs(), state, 0, app.clone()));
+            .child(render_folder_tree(state, app.clone()));
 
-        let tiles = PHOTOS
+        let visible = state.data.visible_photos();
+        let tiles = visible
             .iter()
             .enumerate()
             .map(|(idx, photo)| {
                 let app = app.clone();
                 let is_selected = state.selected.contains(&idx);
+                let location = photo.location.clone().unwrap_or_default();
+                let name = photo.file_name.clone();
+                // 有缩略图用真实图片，否则用色块占位（M0 视觉）
+                let bg_hue = stable_hue(&photo.path.to_string_lossy());
                 Button::new(("photo", idx))
                     .p(px(0.))
                     .relative()
                     .overflow_hidden()
                     .h(px(150.))
                     .w_full()
-                    .bg(photo_block_bg(photo.hue))
+                    .bg(photo_block_bg(bg_hue))
                     .border_2()
                     .when(is_selected, |b| b.border_color(col(GOLD)))
                     .when(!is_selected, |b| b.border_color(transparent_black()))
@@ -622,20 +772,20 @@ impl AppRoot {
                                     .id(("photoicon", idx))
                                     .size(px(32.))
                                     .rounded_full()
-                                    .bg(photo_icon_bg(photo.hue))
+                                    .bg(photo_icon_bg(bg_hue))
                                     .text_color(rgba(255, 255, 255, 0.95))
                                     .items_center()
                                     .justify_center()
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(photo.location.chars().next().unwrap_or('图').to_string()),
+                                    .child(location.chars().next().unwrap_or('图').to_string()),
                             )
                             .child(
                                 div()
                                     .id(("photoname", idx))
                                     .text_size(px(10.))
                                     .text_color(rgba(255, 255, 255, 0.9))
-                                    .child(photo.name.to_owned()),
+                                    .child(name),
                             ),
                     )
                     .child(
@@ -650,11 +800,11 @@ impl AppRoot {
                             .bg(rgba(26, 38, 52, 0.7))
                             .text_color(gpui::white())
                             .text_size(px(10.))
-                            .child(photo.location.to_owned()),
+                            .child(location),
                     )
                     .on_click(move |ev, window, cx| {
                         if ev.modifiers().control || ev.modifiers().platform {
-                            let s = app.update(cx, |s, cx| {
+                            app.update(cx, |s, cx| {
                                 if s.selected.contains(&idx) {
                                     s.selected.remove(&idx);
                                 } else {
@@ -662,13 +812,49 @@ impl AppRoot {
                                 }
                                 cx.notify();
                             });
-                            let _ = s;
                         } else {
                             open_photo_dialog(&app, idx, window, cx);
                         }
                     })
             })
             .collect::<Vec<_>>();
+
+        // 空态：未扫描时给出引导
+        let grid_body: AnyElement = if visible.is_empty() {
+            div()
+                .id("library-empty")
+                .flex_1()
+                .flex().flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(12.))
+                .child(Icon::new(IconName::FolderOpen).size(px(48.)).text_color(col(BORDER_LIGHT)))
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .text_color(col(TEXT_SECONDARY))
+                        .child("相册还是空的"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(col(TEXT_LIGHT))
+                        .child("点击右上角「选择目录」开始建立索引"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("photo-grid-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .grid()
+                .grid_cols(4)
+                .gap(px(12.))
+                .content_start()
+                .children(tiles)
+                .into_any_element()
+        };
 
         let grid_panel = div()
             .id("grid-panel")
@@ -693,11 +879,11 @@ impl AppRoot {
                             .text_color(col(TEXT_SECONDARY))
                             .child("共 ")
                             .child(
-                        div()
-                            .id("grid-count")
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(col(PRIMARY))
-                            .child(format!("{}", PHOTOS.len())),
+                                div()
+                                    .id("grid-count")
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(col(PRIMARY))
+                                    .child(format!("{}", visible.len())),
                             )
                             .child(" 张照片"),
                     )
@@ -711,22 +897,51 @@ impl AppRoot {
                             }),
                     ),
             )
-            .child(
-                div()
-                    .id("photo-grid-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .grid()
-                    .grid_cols(4)
-                    .gap(px(12.))
-                    .content_start()
-                    .children(tiles),
-            );
+            .child(grid_body);
+
+        // 扫描状态条
+        let status_bar = if state.is_scanning || !state.scan_status.is_empty() {
+            div()
+                .id("scan-status")
+                .mb(px(8.))
+                .px(px(12.))
+                .py(px(6.))
+                .rounded_md()
+                .bg(col(GOLD_PALE))
+                .text_size(px(12.))
+                .text_color(col(PRIMARY))
+                .child(state.scan_status.clone())
+        } else {
+            div().id("scan-status-none")
+        };
+
+        // 「选择目录」按钮：点击后弹出原生目录对话框并启动后台扫描
+        let app_for_scan = app.clone();
+        let scanning = state.is_scanning;
+        let scan_btn = Button::new("choose-dir")
+            .primary()
+            .icon(IconName::FolderOpen)
+            .label(if scanning { "扫描中…" } else { "选择目录" })
+            .on_click(move |_ev, _window, cx| {
+                if scanning {
+                    return;
+                }
+                // 原生目录选择对话框（rfd 内部会切到 UI 线程，同步等待即可）
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("选择照片目录")
+                    .pick_folder()
+                {
+                    let path = folder.to_path_buf();
+                    app_for_scan.update(cx, |s, cx| {
+                        s.start_scan(path, cx);
+                    });
+                }
+            });
 
         div()
             .id("page-library")
             .flex().flex_col()
+            .child(status_bar)
             .child(
                 div()
                     .id("library-header")
@@ -734,12 +949,12 @@ impl AppRoot {
                     .justify_between()
                     .items_center()
                     .mb(px(16.))
-                    .child(page_title("🖼️ 相册库", state.photo_header))
+                    .child(page_title("🖼️ 相册库", header_label(state)))
                     .child(
                         div().id("library-actions").flex().flex_row().gap(px(8.)).children(vec![
+                            scan_btn,
                             header_btn(IconName::CaseSensitive, "重命名", TEXT_SECONDARY),
                             header_btn(IconName::FolderOpen, "归档", TEXT_SECONDARY),
-                            header_btn(IconName::Check, "选择", PRIMARY),
                         ]),
                     ),
             )
@@ -777,30 +992,65 @@ fn header_btn(icon: IconName, label: &'static str, color: u32) -> Button {
         .text_color(col(color))
 }
 
-// ===== 目录树（递归） =====
-fn render_folder_tree(
-    folders: &[FolderNode],
-    state: &AppState,
-    base: usize,
-    app: Entity<AppState>,
-) -> impl IntoElement + 'static {
-    let mut out: Vec<AnyElement> = vec![];
-    for (i, folder) in folders.iter().enumerate() {
-        let flat_idx = base + i;
-        let is_active = state.active_folder == flat_idx;
-        let has_children = !folder.children.is_empty();
-        let expanded = if has_children {
-            expandable_id(&folder_defs(), flat_idx)
-                .and_then(|e| state.folder_expanded.get(e).copied())
-                .unwrap_or(true)
-        } else {
-            false
-        };
+/// 根据路径稳定生成色相，保证同一照片每次显示相同占位色。
+fn stable_hue(s: &str) -> f32 {
+    let mut h: u32 = 0;
+    for b in s.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as u32);
+    }
+    (h % 360) as f32
+}
 
-        let app = app.clone();
-        let location = folder.name;
+/// 首页副标题。
+fn subtitle_for_home(state: &AppState) -> String {
+    if !state.data.loaded {
+        "尚未建立索引 · 前往相册库开始".to_string()
+    } else {
+        format!("已索引 {} 张照片 · 全部存储在本地", state.data.total_count)
+    }
+}
+
+/// 相册库标题栏右侧的说明文字。
+fn header_label(state: &AppState) -> String {
+    if !state.data.loaded {
+        return "尚未建立索引".to_string();
+    }
+    let count = state.data.visible_photos().len();
+    let folder = state
+        .active_folder_id
+        .as_deref()
+        .and_then(|id| {
+            crate::ui::library::find_folder(&state.data.folders, id).map(|f| f.name.clone())
+        })
+        .unwrap_or_else(|| "全部照片".to_string());
+    format!("{} · {} 张", folder, count)
+}
+
+// ===== 目录树（递归，基于真实索引） =====
+fn render_folder_tree(state: &AppState, app: Entity<AppState>) -> impl IntoElement + 'static {
+    render_folder_nodes(&state.data.folders, state, app)
+}
+
+fn render_folder_nodes(
+    folders: &[crate::core::model::Folder],
+    state: &AppState,
+    app: Entity<AppState>,
+) -> AnyElement {
+    let mut out: Vec<AnyElement> = vec![];
+    for folder in folders {
+        let key = stable_id(&folder.id);
+        let is_active = state.active_folder_id.as_deref() == Some(folder.id.as_str());
+        let has_children = !folder.children.is_empty();
+        let expanded = state.folder_expanded.contains(&folder.id);
+        let folder_id = folder.id.clone();
+        let folder_path = folder.path.clone();
+        let name = folder.name.clone();
+        let count = folder.photo_count;
+
         let click_app = app.clone();
-        let row = Button::new(("folder", flat_idx))
+        let fid = folder_id.clone();
+        let fpath = folder_path.clone();
+        let row = Button::new(("folder", key))
             .ghost()
             .w_full()
             .justify_start()
@@ -812,7 +1062,7 @@ fn render_folder_tree(
             .when(!is_active, |b| b.text_color(col(TEXT_SECONDARY)))
             .child(
                 div()
-                    .id(("folder-arrow", flat_idx))
+                    .id(("folder-arrow", key))
                     .w(px(16.))
                     .flex_none()
                     .items_center()
@@ -830,39 +1080,43 @@ fn render_folder_tree(
                     ),
             )
             .child(Icon::new(IconName::FolderClosed).size_4().text_color(col(PRIMARY_LIGHTER)))
-            .child(location.to_owned())
+            .child(name.clone())
             .child(
                 div()
-                    .id(("folder-count", flat_idx))
+                    .id(("folder-count", key))
                     .ml_auto()
                     .text_size(px(11.))
                     .text_color(col(TEXT_LIGHT))
-                    .child(folder.count.to_string()),
+                    .child(count.to_string()),
             )
             .on_click(move |_ev, _w, cx| {
-                let s = click_app.update(cx, |s, cx| {
-                    s.active_folder = flat_idx;
+                click_app.update(cx, |s, cx| {
+                    if s.active_folder_id.as_deref() == Some(fid.as_str()) {
+                        s.active_folder_id = None;
+                        s.data.active_folder = None;
+                    } else {
+                        s.active_folder_id = Some(fid.clone());
+                        s.data.active_folder = Some(fpath.clone());
+                    }
                     if has_children {
-                        if let Some(e) = expandable_id(&folder_defs(), flat_idx) {
-                            if let Some(cur) = s.folder_expanded.get_mut(e) {
-                                *cur = !*cur;
-                            }
+                        if !s.folder_expanded.remove(&fid) {
+                            s.folder_expanded.insert(fid.clone());
                         }
                     }
+                    s.selected.clear();
                     cx.notify();
                 });
-                let _ = s;
             });
         out.push(row.into_any_element());
 
         if has_children && expanded {
             out.push(
                 div()
-                    .id(("folder-children", flat_idx))
+                    .id(("folder-children", key))
                     .pl(px(16.))
                     .w_full()
                     .flex().flex_col()
-                    .child(render_folder_tree(&folder.children, state, flat_idx + 1, app))
+                    .child(render_folder_nodes(&folder.children, state, app.clone()))
                     .into_any_element(),
             );
         }
@@ -870,43 +1124,58 @@ fn render_folder_tree(
     div().id("folder-list").w_full().flex().flex_col().children(out).into_any_element()
 }
 
+/// 把字符串 id 转成稳定的 usize，供 gpui ElementId 使用。
+fn stable_id(s: &str) -> usize {
+    let mut h: u64 = 14695981039346656037;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h as usize
+}
+
 // ===== 照片详情对话框 =====
 fn open_photo_dialog(app: &Entity<AppState>, idx: usize, window: &mut Window, cx: &mut App) {
-    let photo = &PHOTOS[idx];
-    let build_tags = || {
-        photo
-            .tags
-            .iter()
-            .enumerate()
-            .map(|(ti, t)| {
-                div()
-                    .id(("tag", ti))
-                    .bg(col(GOLD_PALE))
-                    .text_color(col(PRIMARY))
-                    .px(px(10.))
-                    .py(px(2.))
-                    .rounded_full()
-                    .text_size(px(11.))
-                    .child(t.to_owned())
-                    .into_any_element()
-            })
-            .collect::<Vec<AnyElement>>()
+    // 取可见列表里的第 idx 张真实照片，并把字段克隆为 owned 以进入 'static 闭包
+    let photo = {
+        let state = app.read(cx);
+        match state.data.visible_photos().get(idx) {
+            Some(p) => (*p).clone(),
+            None => return,
+        }
     };
 
-        let info_row = |label: &'static str, value: &'static str| {
-        div()
-            .flex().flex_row()
-            .justify_between()
-            .py(px(6.))
-            .child(div().text_color(col(TEXT_SECONDARY)).child(label.to_owned()))
-            .child(div().text_color(col(PRIMARY)).font_weight(FontWeight::MEDIUM).child(value.to_owned()))
-            .into_any_element()
-    };
+    let name = photo.file_name.clone();
+    let date = photo.date_label();
+    let size = photo.size_label();
+    let file_size = photo.file_size_label();
+    let device = photo.device.clone().unwrap_or_else(|| "未知设备".to_string());
+    let location = photo.location.clone().unwrap_or_else(|| "未知地点".to_string());
+    let tags: Vec<String> = photo.tag_list().into_iter().map(|s| s.to_string()).collect();
+    let hue = stable_hue(&photo.path.to_string_lossy());
+    let has_thumb = photo.thumbnail_path.as_ref().map(|p| p.exists()).unwrap_or(false);
 
-    let _ = app;
+    let preview_hint = if has_thumb { "已生成缩略图缓存" } else { "暂无缩略图" };
     window.open_dialog(cx, move |dialog: Dialog, _w, _cx| {
+        let build_tags = || {
+            tags.iter()
+                .enumerate()
+                .map(|(ti, t)| {
+                    div()
+                        .id(("tag", ti))
+                        .bg(col(GOLD_PALE))
+                        .text_color(col(PRIMARY))
+                        .px(px(10.))
+                        .py(px(2.))
+                        .rounded_full()
+                        .text_size(px(11.))
+                        .child(t.clone())
+                        .into_any_element()
+                })
+                .collect::<Vec<AnyElement>>()
+        };
         dialog
-            .title(format!("照片详情 · {}", photo.name))
+            .title(format!("照片详情 · {}", name))
             .w(px(880.))
             .h(px(540.))
             .py(px(16.))
@@ -930,7 +1199,7 @@ fn open_photo_dialog(app: &Entity<AppState>, idx: usize, window: &mut Window, cx
                                     .id("dialog-preview")
                                     .size(px(340.))
                                     .rounded_lg()
-                                    .bg(photo_block_bg(photo.hue))
+                                    .bg(photo_block_bg(hue))
                                     .items_center()
                                     .justify_center()
                                     .flex().flex_col()
@@ -941,14 +1210,14 @@ fn open_photo_dialog(app: &Entity<AppState>, idx: usize, window: &mut Window, cx
                                             .text_size(px(18.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(rgba(255, 255, 255, 0.95))
-                                            .child(photo.location.to_owned()),
+                                            .child(location.clone()),
                                     )
                                     .child(
                                         div()
                                             .id("dialog-sim")
                                             .text_size(px(12.))
                                             .text_color(rgba(255, 255, 255, 0.75))
-                                            .child("模拟预览 · 实际为照片缩略图"),
+                                            .child(preview_hint),
                                     ),
                             ),
                     )
@@ -963,28 +1232,13 @@ fn open_photo_dialog(app: &Entity<AppState>, idx: usize, window: &mut Window, cx
                             .border_color(col(BORDER_LIGHT))
                             .overflow_y_scroll()
                             .flex().flex_col()
-                            .child(info_row("文件名", photo.name))
-                            .child(info_row("拍摄日期", photo.date))
-                            .child(info_row("尺寸", photo.size))
-                            .child(info_row("文件大小", photo.file_size))
-                            .child(info_row("设备", photo.device))
-                            .child(info_row("地点", photo.location))
+                            .child(info_row("文件名", name.clone()))
+                            .child(info_row("拍摄日期", date.clone()))
+                            .child(info_row("尺寸", size.clone()))
+                            .child(info_row("文件大小", file_size.clone()))
+                            .child(info_row("设备", device.clone()))
+                            .child(info_row("地点", location.clone()))
                             .child(info_tag_section("🏷️ 标签", build_tags()))
-                            .child(
-                                div()
-                                    .id("dialog-album")
-                                    .mt_3()
-                                    .child(
-                                        div()
-                                            .id("album-label")
-                                            .text_size(px(12.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(col(TEXT_SECONDARY))
-                                            .mb(px(6.))
-                                            .child("📂 所属相册"),
-                                    )
-                                    .child(div().text_size(px(13.)).text_color(col(TEXT_SECONDARY)).child("日本旅行")),
-                            )
                             .child(
                                 div()
                                     .id("dialog-actions")
@@ -1005,6 +1259,16 @@ fn open_photo_dialog(app: &Entity<AppState>, idx: usize, window: &mut Window, cx
                 true
             })
     });
+}
+
+fn info_row(label: &'static str, value: impl Into<SharedString>) -> AnyElement {
+    div()
+        .flex().flex_row()
+        .justify_between()
+        .py(px(6.))
+        .child(div().text_color(col(TEXT_SECONDARY)).child(label))
+        .child(div().text_color(col(PRIMARY)).font_weight(FontWeight::MEDIUM).child(value.into()))
+        .into_any_element()
 }
 
 fn info_tag_section(title: &'static str, tags: Vec<AnyElement>) -> AnyElement {

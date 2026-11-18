@@ -3,6 +3,7 @@
 > 编制时间：2026-11-16 16:15 +0800
 > 更新时间：2026-11-16 16:32 +0800（确认个人使用 / imageflow 子模块 / 无 HEIC，新增照片足迹）
 > 更新时间：2026-11-16 16:44 +0800（照片足迹相关功能本期暂缓，保留规划不实施；开始 M0 工程地基）
+> 更新时间：2026-11-18 15:10 +0800（M0 完成；M1 真实索引完成：目录选择/递归扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索，相册库与首页接真实数据）
 > 文档性质：规划文档，非 `.docs/modules/` 下的派生缓存；不参与覆盖 hash 校验。
 > 依据：`design.md`（PRD v1）与 2026-11-16 的源码现状（见 `.docs/INDEX.md`）。
 
@@ -130,11 +131,13 @@ OxiGeo 可行性结论：**可以做，但不是照片足迹的核心依赖**。
 
 验收：`cargo check` 与 `cargo test` 通过；窗口视觉与当前一致；`core` 中不出现 gpui 引用。此阶段属于**结构性变更**，须重写 ui-desktop 模块文档、新增 core/ui 子模块文档并更新 INDEX 依赖图。
 
-### M1 · 真实索引与相册库
+### M1 · 真实索引与相册库 — 已完成（2026-11-18）
 
 任务：实现目录选择、`walkdir` 递归扫描、EXIF 解析、内容哈希、缩略图生成与增量更新；建立 SQLite schema 与 Repository；用数据库替换 `PHOTOS` 和 `folder_defs()`；目录树从真实路径派生；目录点击过滤照片网格；基础排序与搜索。
 
 验收：选择一个含 N 张照片的目录，相册库显示 N 张真实照片；重复扫描不产生重复记录；5000 张照片的扫描和滚动不阻塞 UI。完成后重写 ui-desktop 模块文档并新增 scanner/db 模块文档。
+
+> **实际交付（2026-11-18）**：目录选择（rfd）、walkdir 扫描、EXIF（时间/设备）、twox-hash 内容哈希、`image` 缩略图缓存（400px）、SQLite schema + Repository、增量 upsert 与 sweep 清理、目录树派生与点击过滤、关键词搜索均已实现；相册库与首页统计改为真实数据。8 个测试通过（含临时目录扫描集成测试）。**偏差与遗留**：① `rusqlite bundled` 依赖已验证可编译，crates.io 可访问（GitHub git 依赖仍不通，zen-codecs 未切换）；② 缩略图 UI 仍用色块占位，`thumbnail_for` 已返回缓存路径，接 gpui `img()` 即可显示真图；③ 排序 UI 未做（Repository 已按时间倒序）；④ 5000 张性能基线未实测；⑤ M0 模拟数据常量待清理。已同步 ui-desktop/core-model/core-scanner/build-config 模块 md 与 INDEX。
 
 ### M2 · 分析与智能整理
 

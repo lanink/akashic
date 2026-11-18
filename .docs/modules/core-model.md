@@ -1,45 +1,47 @@
 # 模块：core-model
 
-> 生成时间：2026-11-16 17:35 +0800
+> 生成时间：2026-11-18 15:10 +0800
 > 覆盖范围：src/core/config.rs, src/core/mod.rs, src/core/model.rs（按路径排序）
-> 覆盖 hash：e28c0dec42be（取前 12 位，由生成者用命令行工具计算）
+> 覆盖 hash：26c49c6040ee（取前 12 位，由生成者用命令行工具计算）
 > 可信度：AI 生成未审
 > 状态：valid
 
 ## 职责
-核心层的纯数据模型与本地路径配置，不依赖 gpui，可独立单元测试。M0 阶段沿用设计稿模拟数据，M1 将用真实索引数据库替换。
+核心层的数据模型与本地路径配置，不依赖 gpui，可独立单元测试。M1 引入真实 `Photo`/`ScanRoot`/`Folder`/`ScanStats`/`ScanProgress` 结构；M0 模拟数据（`PhotoDef`/`PHOTOS`/`FolderNode`/`folder_defs`）仍保留但 UI 已不再使用，待清理。
 
 ## 对外接口
-- `pub struct PhotoDef`（src/core/model.rs）：模拟照片定义，字段 `name/date/size/file_size/device/location/tags/hue` 均 `pub`。
-- `pub const PHOTOS: &[PhotoDef]`：12 张模拟照片。
-- `pub struct FolderNode`（src/core/model.rs）：目录树节点，字段 `name/count/children` 均 `pub`。
-- `pub fn folder_defs() -> Vec<FolderNode>`：构造静态相册目录树（日本旅行/生日派对/四姑娘山/2024年/2023年及子目录）。
-- `pub fn expandable_id(folders: &[FolderNode], target: usize) -> Option<usize>`：深度优先扁平索引到可展开节点下标的映射。
-- `pub const APP_ID: &str = "akashic"`（src/core/config.rs）：应用标识。
-- `pub struct Paths`（src/core/config.rs）：本地路径集合，字段 `data_dir/cache_dir/trash_dir/db_path/log_path` 均 `pub`。
-- `pub fn Paths::from_app_dir(base: PathBuf) -> Self`：基于给定基目录派生全部路径。
-- `pub fn Paths::platform_default() -> Option<Self>`：用 `dirs::data_local_dir()` 定位平台应用数据目录。
-- `pub fn Paths::ensure_dirs(&self) -> std::io::Result<()>`：幂等创建全部目录。
+- `pub struct Photo`（src/core/model.rs）：真实照片记录，字段 `id/path/file_name/size_bytes/date_taken/modified_at/width/height/device/location/tags/content_hash/thumbnail_path/gps_lon_wgs84/gps_lat_wgs84` 均 `pub`。
+- `Photo` 方法：`fn size_label() -> String`、`fn file_size_label() -> String`、`fn date_label() -> String`、`fn tag_list() -> Vec<&str>`。
+- `pub struct ScanRoot`：`id/path/last_scanned_at/photo_count`。
+- `pub struct Folder`：`id/name/path/photo_count/children`，目录树节点。
+- `pub struct ScanStats`：`photos_found/photos_added/photos_updated/photos_skipped/photos_removed/errors/duration_ms`。
+- `pub enum ScanProgress`：`Started{root}` / `Scanning{processed}` / `Finished{stats}` / `Failed{message}`。
+- `pub const APP_ID: &str = "akashic"`、`pub struct Paths`（src/core/config.rs，字段 `data_dir/cache_dir/trash_dir/db_path/log_path`）。
+- `Paths` 方法：`from_app_dir(base: PathBuf) -> Self`、`platform_default() -> Option<Self>`、`ensure_dirs() -> std::io::Result<()>`。
+- M0 遗留：`PhotoDef`、`PHOTOS`、`FolderNode`、`folder_defs()`、`expandable_id()`（UI 已不引用）。
 
 ## 内部关键流程
-1. UI 层通过 `folder_defs()` / `PHOTOS` 读取模拟数据渲染相册库与目录树。
-2. 目录展开状态由 `expandable_id` 将深度优先扁平索引映射到 `AppState.folder_expanded` 数组下标。
-3. 组合根 `main.rs` 启动时调用 `Paths::platform_default()` → `ensure_dirs()`，确保索引库、缩略图缓存、回收站目录存在。
-4. 单元测试 `paths_derive_from_base` 在临时基目录验证路径派生正确性（无需真实文件系统写入）。
+1. scanner 扫描后构造 `Photo`，`db::upsert_photo` 写入索引；UI 通过 `LibraryData::reload` 读回。
+2. `Photo` 的 `*_label` 方法把原始字段转成 UI 展示文本（尺寸、大小、日期、标签）。
+3. 扫描进度用 `ScanProgress` 经 channel 从后台线程发给 UI。
+4. 组合根调用 `Paths::platform_default/ensure_dirs` 确保本地目录存在。
 
 ## 依赖关系
-- 依赖的外部模块：`dirs`（crate，定位应用数据目录）、`std::fs`/`std::path`。
-- 被谁依赖：`ui-desktop`（读取 `PHOTOS`/`folder_defs`/`expandable_id`）、`main.rs` 组合根（读取 `Paths`）。
+- 依赖的外部模块：`dirs`（应用数据目录）、`std::fs`/`std::path`。
+- 被谁依赖：`core-scanner`（构造 Photo/ScanStats）、`ui-desktop`（LibraryData 消费 Photo/Folder）、`main.rs`（Paths）。
 
 ## 常见改动点
-- M1 接入真实索引：替换 `PHOTOS`/`folder_defs` 为数据库查询，保持对外接口形状或同步更新 UI 调用方。
-- 新增配置项：在 `Paths` 增加字段并在 `from_app_dir` 派生，同步补 `paths_derive_from_base` 断言。
-- 新增纯数据模型（`Photo`/`Folder`/`Operation` 等）：在本模块新增文件并在 `core/mod.rs` 注册 pub mod。
+- 新增照片字段：在 `Photo` 加字段 → 同步 `db.rs` 的 schema、`row_to_photo`、`upsert_photo` 与扫描构造处。
+- 调整展示格式：改 `Photo::*_label` 方法。
+- 新增扫描进度类型：扩展 `ScanProgress` 并同步 UI 轮询处理。
+- 清理 M0 模拟数据：确认 UI 无引用后删除 `PhotoDef/PHOTOS/FolderNode/folder_defs/expandable_id`。
 
 ## 已知风险 / 易错点
-- `dirs` 版本必须与 Cargo.lock 一致（当前 4.0.0），写 6.x 会触发联网解析导致离线构建失败。
-- `Paths::platform_default()` 在极少数无标准应用数据目录的平台返回 `None`，调用方需处理。
-- 本模块不得引入 gpui 依赖，否则破坏 `main → ui → core` 单向分层与可测试性。
+- `dirs` 锁定 4.0.0（与 Cargo.lock 一致），改 6.x 会触发离线解析失败。
+- `Photo` 字段新增若漏改 `row_to_photo` 的列索引，会导致数据错位且难以察觉。
+- gps_* 字段本期预留但不采集（地图功能暂缓），不要误填。
+- 本模块不得引入 gpui 依赖。
 
 ## 变更记录
-- 2026-11-16 17:35：M0 结构性变更，新建 core 层；从原 `main.rs` 迁入纯数据模型，新增 `config.rs` 本地路径配置。
+- 2026-11-18 15:10：M1 引入真实数据模型（Photo/ScanRoot/Folder/ScanStats/ScanProgress），新增 `photos_removed` 统计；整模块重写。
+- 2026-11-16 17:35：M0 新建 core 层，迁入模拟数据与路径配置。

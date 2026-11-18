@@ -1,47 +1,49 @@
 # 模块：ui-desktop
 
-> 生成时间：2026-11-16 17:35 +0800
-> 覆盖范围：src/ui/app.rs, src/ui/assets.rs, src/ui/mod.rs（按路径排序）
-> 覆盖 hash：61a24377e14e（取前 12 位，由生成者用命令行工具计算）
+> 生成时间：2026-11-18 15:10 +0800
+> 覆盖范围：src/ui/app.rs, src/ui/assets.rs, src/ui/library.rs, src/ui/mod.rs（按路径排序）
+> 覆盖 hash：a777486cc90b（取前 12 位，由生成者用命令行工具计算）
 > 可信度：AI 生成未审
 > 状态：valid
 
 ## 职责
-基于 gpui / gpui-component 的桌面端 UI 层，实现窗口标题栏、深色侧栏、首页、智能整理页、相册库页、重命名/回收站占位页与照片详情弹窗。M0 结构性变更后，所有渲染代码从 `main.rs` 迁入 `src/ui/`，纯数据改由 `core::model` 提供。数据仍为静态模拟，尚未接入真实扫描或图像算法。
+基于 gpui / gpui-component 的桌面 UI 层。M1 起相册库/首页从本地 SQLite 索引读取真实数据，支持原生目录选择、后台扫描、目录过滤、多选与照片详情；智能整理/重命名/回收站仍为占位。
 
 ## 对外接口
-- `pub struct AppState`（src/ui/app.rs）：应用全局状态，字段私有。
-- `pub fn new_app_state(cx: &mut App) -> Entity<AppState>`：创建初始状态供组合根调用；初始页 `Page::Library`。
-- `pub struct AppRoot`（src/ui/app.rs）：根渲染组件。
-- `pub fn AppRoot::new(app: Entity<AppState>) -> Self`：构造根组件。
-- `impl Render for AppRoot { fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement }`：根布局渲染。
-- `pub struct Assets`（src/ui/assets.rs）+ `impl AssetSource for Assets`：`fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>>`；`fn list(&self, _path: &str) -> Result<Vec<SharedString>>`。编译期嵌入 22 个图标 ID。
+- `pub struct AppState`：`page/paths/data/active_folder_id/folder_expanded/selected/scan_status/is_scanning/progress_rx`（字段私有）。
+- `pub fn new_app_state(cx: &mut App, paths: Paths) -> Entity<AppState>`：创建初始状态并尝试从索引加载。
+- `AppState::visible_count() -> usize`、`AppState::start_scan(root: PathBuf, cx: &mut Context<Self>)`：启动后台扫描。
+- `pub struct AppRoot` + `pub fn AppRoot::new(app: Entity<AppState>) -> Self` + `impl Render`。
+- `pub struct Assets` + `impl AssetSource`（src/ui/assets.rs，编译期嵌入 22 个图标）。
+- `LibraryData`（src/ui/library.rs）：`reload(conn) -> Result<Self>`、`visible_photos() -> Vec<&Photo>`、`thumbnail_for(&Photo) -> Option<PathBuf>`；字段 `photos/folders/active_folder/keyword/loaded/root_count/total_count/total_bytes`。
+- `library` 辅助：`folder_flat_ids`、`find_folder`、`is_under`。
 
 ## 内部关键流程
-1. 组合根 `main.rs` 调用 `new_app_state(cx)` → `AppRoot::new(state)` → `Root::new(view, window, cx)`。
-2. `AppRoot::render` 拼装 `titlebar`、`sidebar`（`AppRoot::sidebar`）、`content`（`AppRoot::render_page`），外层固定 1200×780 窗口卡片。
-3. `AppRoot::sidebar` 为 5 个导航项生成 `Button::new(...).on_click`，点击 `app.update` 修改 `AppState.page` 并 `cx.notify()`；设置按钮 `on_click` 为空闭包。
-4. `AppRoot::render_page` 按 `Page` 分发：`Home`/`Organize`/`Library` 分别对应 `page_home`/`page_organize`/`page_library`，`Rename`/`Trash` → `page_placeholder`。
-5. `page_library` → `core::model::folder_defs()` + `render_folder_tree` 生成目录面板；`core::model::PHOTOS` 枚举生成 4 列照片网格。点击照片含 Ctrl/Platform 修饰键则切换 `AppState.selected`，否则 `open_photo_dialog`。
-6. `render_folder_tree` 递归输出 `AnyElement`，节点点击更新 `active_folder` 并切换 `folder_expanded[expandable_id(...)]`；`expandable_id` 由 `core::model` 提供。
-7. `open_photo_dialog` → `window.open_dialog`，左侧色块模拟预览，右侧显示文件名/日期/尺寸/大小/设备/地点/标签，底部收藏/标签/移动/删除按钮；`on_ok` 仅 `window.close_dialog`。
+1. `main.rs` 构造 Paths → `new_app_state(cx, paths)` → 内部 `db::open` + `LibraryData::reload` 加载已有索引 → `AppRoot::new` → `Root::new`。
+2. 相册库「选择目录」→ `rfd::FileDialog::pick_folder` → `app.update(...start_scan(root))` → 后台线程打开独立 DB 连接执行 `scanner::scan_root`，进度经 `mpsc::channel` 回传。
+3. `cx.spawn` 异步任务每 150ms 用 `gpui::background_executor().timer()` 轮询 channel：`Started/Scanning` 更新 `scan_status`，`Finished/Failed` 重新 `LibraryData::reload` 并 `cx.notify()`。
+4. `page_library` 从 `data.visible_photos()` 渲染网格（按目录前缀 + 关键词过滤）；`render_folder_tree` 递归渲染 `data.folders`（Folder 类型，id 用稳定 hash 转 usize 作 gpui ElementId），点击切换 `active_folder_id` 并重算过滤。
+5. 照片点击：Ctrl/Command 多选切 `selected`，否则 `open_photo_dialog` 从真实 Photo 显示文件名/日期/尺寸/大小/设备/地点/标签。
+6. 首页 `page_home` 从 `data.total_count/total_bytes/root_count` 显示真实统计；无索引时展示引导空态。
 
 ## 依赖关系
-- 依赖的外部模块：`akashic::core::model`（`folder_defs`/`PHOTOS`/`FolderNode`/`expandable_id`）、gpui、gpui-component、assets/icons（见 icon-assets 模块）。
-- 被谁依赖：`main.rs`（组合根调用 `new_app_state`/`AppRoot`/`Assets`）。
+- 依赖的外部模块：`core-model`（Photo/Folder）、`core-scanner`（db/scanner）、`core-config`（Paths）、`rfd`（目录对话框）、gpui/gpui-component、icon-assets。
+- 被谁依赖：`main.rs` 组合根。
 
 ## 常见改动点
-- 新增页面：扩展 `Page` 枚举 → `sidebar` 增加导航项 → `render_page` 增加分支。
-- 接入真实相册：替换 `core::model` 的静态数据，补充扫描、缩略图加载与筛选逻辑。
-- 让工具卡片/操作按钮生效：为 `page_organize` 工具卡片、`header_btn`、`open_photo_dialog` 底部按钮补 `on_click`。
-- 调整视觉：文件头部颜色常量、`page_*` 函数尺寸间距；同步检查 design-prototype 模块。
+- 新增页面：扩展 `Page` 枚举 → `sidebar` → `render_page`。
+- 改扫描交互：调整 `start_scan` 的后台线程与 channel 轮询逻辑。
+- 缩略图真实显示：`LibraryData::thumbnail_for` 已返回缓存路径，UI 当前仍用色块占位；接入 gpui `img()` 加载该文件即可。
+- 整理工具生效：为 `page_organize` 卡片补 `on_click`（M2）。
 
 ## 已知风险 / 易错点
-- 全为模拟数据：12 张照片、目录数量、首页统计（8,432 张 / 42.6 GB）与侧栏徽标均为硬编码。
-- 目录点击只改变高亮与展开状态，不过滤右侧照片网格；重命名页、回收站页仅为占位。
-- 详情弹窗收藏/标签/移动/删除按钮无实际效果，`on_ok` 只关闭窗口。
-- `Assets::load` 显式列出 22 个图标 ID，新增 SVG 不登记则运行时无法加载（当前未用 book-open/search/close/plus）。
-- `AppState` 必须为 `pub`（出现在公共函数签名中），否则 `main.rs` 无法编译。
+- gpui 0.2.2 `cx.spawn` 异步闭包签名是 `FnOnce(WeakEntity<T>, &mut AsyncApp)`；异步上下文用全局 `gpui::background_executor()`，无 `cx.background_executor()`。
+- gpui ElementId 不接受 `String`，目录树用 `stable_id()` 转 usize；不同目录 hash 冲突概率极低但非零。
+- `state` 从 `self.app.read(cx)` 借用期间不能再可变借用 cx，故 page_* 函数开头即把数据提取为 owned 值。
+- `open_dialog` 闭包是 `Fn`（非 FnOnce），捕获的 String 必须 `.clone()` 后再传入内部函数。
+- rfd 目录对话框用同步 `pick_folder()`（会短暂阻塞 UI），换异步需处理 `AsyncApp` 生命周期。
+- 首页外的 `page_organize` 工具卡片 badge（12组/43张等）仍为硬编码，属 M2 范围。
 
 ## 变更记录
-- 2026-11-16 17:35：M0 结构性变更，`main.rs` 的 UI 代码迁入 `src/ui/{app,assets,mod}.rs`，纯数据迁至 `core::model`；整模块按模板重写。
+- 2026-11-18 15:10：M1 数据流改为真实索引；新增 `ui/library.rs` 适配层，接入目录选择/后台扫描/目录过滤/真实统计；整模块重写。
+- 2026-11-16 17:35：M0 从 main.rs 迁入 UI 代码。

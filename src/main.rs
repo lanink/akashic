@@ -10,10 +10,11 @@ use akashic::ui::assets::Assets;
 
 fn main() {
     // 确保本机应用数据目录就绪（索引、缓存、回收站）。
-    if let Some(paths) = Paths::platform_default() {
-        if let Err(e) = paths.ensure_dirs() {
-            eprintln!("[akashic] 无法初始化本地目录: {e}");
-        }
+    let paths = Paths::platform_default().unwrap_or_else(|| {
+        Paths::from_app_dir(std::env::temp_dir().join("akashic"))
+    });
+    if let Err(e) = paths.ensure_dirs() {
+        eprintln!("[akashic] 无法初始化本地目录: {e}");
     }
 
     let app = gpui::Application::new().with_assets(Assets);
@@ -27,8 +28,9 @@ fn main() {
                 })),
                 ..WindowOptions::default()
             };
+            let paths_for_window = paths.clone();
             cx.open_window(options, |window, cx| {
-                let state = new_app_state(cx);
+                let state = new_app_state(cx, paths_for_window);
                 let view = cx.new(|_| AppRoot::new(state));
                 cx.new(|cx| Root::new(view, window, cx))
             })?;

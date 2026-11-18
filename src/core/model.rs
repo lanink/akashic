@@ -1,5 +1,109 @@
-//! 数据模型骨架（M0 阶段沿用设计稿模拟数据，行为与原型一致）。
-//! M1 将用真实索引数据库替换 `PHOTOS` 与 `folder_defs()`。
+//! 数据模型：M1 引入的真实照片/扫描根目录/目录树结构，以及 M0 模拟数据（UI 切换完成后移除）。
+//! 本模块不依赖 gpui，可独立单元测试。
+
+use std::path::PathBuf;
+
+/// 一张真实照片的索引记录（对应 SQLite `photos` 表一行）。
+#[derive(Clone, Debug)]
+pub struct Photo {
+    pub id: i64,
+    /// 绝对路径
+    pub path: PathBuf,
+    pub file_name: String,
+    pub size_bytes: i64,
+    /// EXIF 拍摄时间（格式 YYYY-MM-DD HH:MM:SS）；无 EXIF 时退化为文件修改时间
+    pub date_taken: Option<String>,
+    pub modified_at: i64,
+    pub width: i32,
+    pub height: i32,
+    pub device: Option<String>,
+    /// 展示用地点文字（本期无逆地理编码，取目录名或空）
+    pub location: Option<String>,
+    /// 标签，以逗号分隔存储
+    pub tags: String,
+    /// 内容哈希（BLAKE3/xxhash 等，作为去重与缩略图缓存 key）
+    pub content_hash: String,
+    /// 缩略图缓存绝对路径
+    pub thumbnail_path: Option<PathBuf>,
+    /// GPS 字段预留（本期暂缓采集与展示）
+    pub gps_lon_wgs84: Option<f64>,
+    pub gps_lat_wgs84: Option<f64>,
+}
+
+impl Photo {
+    /// 展示用尺寸字符串，如 `4032×3024`。
+    pub fn size_label(&self) -> String {
+        if self.width > 0 && self.height > 0 {
+            format!("{}×{}", self.width, self.height)
+        } else {
+            "—".to_string()
+        }
+    }
+
+    /// 人类可读的文件大小。
+    pub fn file_size_label(&self) -> String {
+        let kb = self.size_bytes as f64 / 1024.0;
+        if kb >= 1024.0 {
+            format!("{:.1} MB", kb / 1024.0)
+        } else {
+            format!("{:.0} KB", kb)
+        }
+    }
+
+    /// 展示用日期字符串（无 EXIF 时显示“未知时间”）。
+    pub fn date_label(&self) -> String {
+        self.date_taken.clone().unwrap_or_else(|| "未知时间".to_string())
+    }
+
+    /// 标签列表（按逗号切分并去空白）。
+    pub fn tag_list(&self) -> Vec<&str> {
+        self.tags.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
+    }
+}
+
+/// 一个用户选择的扫描根目录。
+#[derive(Clone, Debug)]
+pub struct ScanRoot {
+    pub id: i64,
+    pub path: PathBuf,
+    pub last_scanned_at: i64,
+    /// 该根目录累计索引的照片数
+    pub photo_count: i64,
+}
+
+/// 从索引路径派生的目录树节点（UI 相册库目录面板使用）。
+#[derive(Clone, Debug)]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub photo_count: usize,
+    pub children: Vec<Folder>,
+}
+
+/// 扫描统计结果。
+#[derive(Clone, Debug, Default)]
+pub struct ScanStats {
+    pub photos_found: usize,
+    pub photos_added: usize,
+    pub photos_updated: usize,
+    pub photos_skipped: usize,
+    /// 增量清理移除的失效记录数
+    pub photos_removed: usize,
+    pub errors: usize,
+    pub duration_ms: u128,
+}
+
+/// 扫描进度事件（后台线程 → UI）。
+#[derive(Clone, Debug)]
+pub enum ScanProgress {
+    Started { root: PathBuf },
+    Scanning { processed: usize },
+    Finished { stats: ScanStats },
+    Failed { message: String },
+}
+
+// ===== 以下为 M0 模拟数据，UI 切换完成后移除 =====
 
 /// 设计稿中的模拟照片定义。
 pub struct PhotoDef {
