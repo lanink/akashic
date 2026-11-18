@@ -9,9 +9,10 @@
 > 更新日期：2026-11-18 15:10 +0800（M1 真实索引：新增 core-scanner 模块 md；相册库/首页接真实数据；新增 M1 依赖）。
 > 更新日期：2026-11-18 15:40 +0800（M2 分析与智能整理：新增 core-analyze 模块 md 与 ui/analyze.rs、tests/analyze_test.rs；整理页接真实分析结果与后台分析调度）。
 > 更新日期：2026-11-18 16:05 +0800（M3 批量操作与回收站：新增 core-ops 模块 md 与 ui/ops.rs、tests/ops_test.rs；相册库批量删除/重命名、重命名页与回收站页）。
+> 更新日期：2026-11-18 16:35 +0800（修复缩略图不显示：所有照片展示位接入 gpui `img(PathBuf)` 真实缩略图，详情弹窗升级为原图大图 + 完整图像信息；刷新 ui-desktop hash）。
 
 ## 项目概述
-Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引（目录选择/后台扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索）。M2 已实现分析与智能整理：模糊评分、截图启发式、大文件排序、相似归组（pHash + dssim + 并查集），扫描后自动后台分析，整理页 4 个工具卡片接入真实结果列表。M3 已实现批量操作与回收站：批量删除（移动到回收站，绝不永久丢失）、批量重命名（预设模板+预览+冲突处理+一次撤销）、回收站恢复/清空/30 天清理，操作日志贯穿。智能归档仍属后续里程碑（占位）。
+Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引（目录选择/后台扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索）。M2 已实现分析与智能整理：模糊评分、截图启发式、大文件排序、相似归组（pHash + dssim + 并查集），扫描后自动后台分析，整理页 4 个工具卡片接入真实结果列表。M3 已实现批量操作与回收站：批量删除（移动到回收站，绝不永久丢失）、批量重命名（预设模板+预览+冲突处理+一次撤销）、回收站恢复/清空/30 天清理，操作日志贯穿。所有照片展示位（相册库网格/整理结果/相似组/回收站）已接入 gpui `img(PathBuf)` 真实缩略图，点击照片弹出原图大图 + 完整图像信息（基本信息/分析结果/索引字段）。智能归档仍属后续里程碑（占位）。
 
 ## 目录职责表
 
@@ -23,7 +24,7 @@ Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私�
 | `src/core/db.rs` / `scanner.rs` / `thumbnail.rs` | SQLite 索引、递归扫描+EXIF+哈希、缩略图缓存、分析结果读写 | [core-scanner](modules/core-scanner.md) |
 | `src/core/analyze/*.rs` | 模糊评分、截图识别、大文件排序、相似归组（pHash+dssim+并查集） | [core-analyze](modules/core-analyze.md) |
 | `src/core/ops/*.rs` | 回收站（删除/恢复/清空/30 天清理/撤销）与批量重命名模板引擎、操作日志 | [core-ops](modules/core-ops.md) |
-| `src/ui/app.rs` / `assets.rs` | gpui 渲染：全局状态、页面分发、目录树、照片弹窗、整理页结果列表、重命名页、回收站页、图标资源 | [ui-desktop](modules/ui-desktop.md) |
+| `src/ui/app.rs` / `assets.rs` | gpui 渲染：全局状态、页面分发、目录树、照片图片渲染（缩略图/原图大图）、详情弹窗、整理页结果列表、重命名页、回收站页、图标资源 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/library.rs` | UI 数据适配层：索引数据 → 相册库视图模型 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/analyze.rs` | UI 分析适配层：分析结果 → 整理页视图模型 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/ops.rs` | UI 批量操作适配层：回收站/操作日志 → 回收站页视图模型 | [ui-desktop](modules/ui-desktop.md) |
@@ -89,6 +90,8 @@ ai-workflow ──> 约束所有 Agent 对以上模块的读取与文档更新
 - 批量删除入口：相册库「删除到回收站」→ `AppState::batch_trash` → `core::ops::trash::trash_photos`（移动到回收站+写库）→ `reload_all`；撤销 `undo_trash`。
 - 重命名入口：相册库「重命名」→ `Page::Rename`（预设模板+预览）→ `AppState::batch_rename` → `core::ops::rename::execute`；撤销 `undo_rename`。
 - 回收站入口：侧栏「回收站」→ `Page::Trash`（`OpsData`）→ 恢复 `restore_items` / 清空 `empty_trash` / 30 天清理 `purge_expired`。
+- 图片渲染入口：`src/ui/app.rs::photo_thumb(&Photo)` → `thumbnail_source`（缩略图缓存优先）→ `gpui::img(PathBuf)`（`Resource::Path` → `fs::read` + `image` 解码，不经过 `Assets`）→ `ObjectFit::Cover` + fallback/loading 色块降级。详情大图走 `preview_source`（原图优先）+ `ObjectFit::Contain`。
+- 图片详情入口：普通点击照片 → `open_photo_dialog(photo: Photo, window, cx)` → 原图大图 + 基本信息/分析结果/索引分区 + 「打开原图」/「所在文件夹」。
 - 真实数据：`src/core/db.rs`（Repository）、`src/core/scanner.rs`（扫描）、`src/ui/library.rs`（视图适配）；模型在 `core/model.rs`，路径在 `core/config.rs`。
 - 分析算法：`src/core/analyze/`（blur / classify / similarity / pipeline）；测试 `tests/analyze_test.rs`。
 - 批量操作：`src/core/ops/`（trash / rename / mod）；测试 `tests/ops_test.rs`。
@@ -99,7 +102,7 @@ ai-workflow ──> 约束所有 Agent 对以上模块的读取与文档更新
 
 | 模块 | 覆盖 hash | 状态 | 可信度 |
 | --- | --- | --- | --- |
-| ui-desktop | d6aab21a0a19 | valid | AI 生成未审 |
+| ui-desktop | 0c2dd63c5d2a | valid | AI 生成未审 |
 | core-model | e7729140f3e4 | valid | AI 生成未审 |
 | core-scanner | c56f5c922fb5 | valid | AI 生成未审 |
 | core-analyze | f49408cd46d5 | valid | AI 生成未审 |

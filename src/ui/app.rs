@@ -13,7 +13,7 @@ use gpui_component::WindowExt;
 use crate::core::analyze::{AnalyzeProgress, AnalyzeReport};
 use crate::core::config::Paths;
 use crate::core::ops::{rename as ops_rename, trash as ops_trash};
-use crate::core::model::{ScanProgress, ScanStats};
+use crate::core::model::{Photo, ScanProgress, ScanStats};
 use crate::ui::analyze::AnalyzeData;
 use crate::ui::library::LibraryData;
 use crate::ui::ops::OpsData;
@@ -1072,9 +1072,9 @@ impl AppRoot {
     }
 
     /// 通用照片结果列表（模糊/截图/大文件）。
-    fn render_photo_list(&self, photos: &[crate::core::model::Photo], title: &str, sub: &str) -> impl IntoElement + 'static {
+    fn render_photo_list(&self, photos: &[Photo], title: &str, sub: &str) -> impl IntoElement + 'static {
         let tiles: Vec<_> = photos.iter().enumerate().map(|(i, p)| {
-            let hue = stable_hue(&p.path.to_string_lossy());
+            let dialog_photo = p.clone();
             div()
                 .id(("resultitem", i))
                 .w(px(180.))
@@ -1082,16 +1082,15 @@ impl AppRoot {
                 .rounded_lg()
                 .overflow_hidden()
                 .shadow_sm()
+                .cursor_pointer()
+                .on_click(move |_ev, window, cx| open_photo_dialog(dialog_photo.clone(), window, cx))
                 .child(
                     div()
                         .id(("resultthumb", i))
                         .h(px(110.))
                         .w_full()
-                        .bg(photo_block_bg(hue))
-                        .flex().flex_col()
-                        .items_center()
-                        .justify_center()
-                        .child(Icon::new(IconName::Frame).size(px(28.)).text_color(rgba(255,255,255,0.9))),
+                        .overflow_hidden()
+                        .child(photo_thumb(p)),
                 )
                 .child(
                     div()
@@ -1131,6 +1130,10 @@ impl AppRoot {
             let rep = g.members.first();
             let name = rep.map(|p| p.file_name.clone()).unwrap_or_default();
             let hue = rep.map(|p| stable_hue(&p.path.to_string_lossy())).unwrap_or(0.0);
+            let dialog_photo = rep.cloned();
+            let thumb_el = rep
+                .map(photo_thumb)
+                .unwrap_or_else(|| photo_placeholder(hue, "", &name));
             div()
                 .id(("group", gi))
                 .w(px(220.))
@@ -1138,10 +1141,15 @@ impl AppRoot {
                 .rounded_lg()
                 .overflow_hidden()
                 .shadow_sm()
+                .cursor_pointer()
+                .on_click(move |_ev, window, cx| {
+                    if let Some(p) = dialog_photo.clone() {
+                        open_photo_dialog(p, window, cx);
+                    }
+                })
                 .child(
-                    div().id(("groupthumb", gi)).h(px(120.)).w_full().bg(photo_block_bg(hue))
-                        .flex().flex_col().items_center().justify_center()
-                        .child(Icon::new(IconName::Copy).size(px(30.)).text_color(rgba(255,255,255,0.9))),
+                    div().id(("groupthumb", gi)).h(px(120.)).w_full().overflow_hidden()
+                        .child(thumb_el),
                 )
                 .child(
                     div().id(("groupinfo", gi)).px(px(12.)).py(px(10.))
@@ -1188,48 +1196,18 @@ impl AppRoot {
                 let app = app.clone();
                 let is_selected = state.selected.contains(&idx);
                 let location = photo.location.clone().unwrap_or_default();
-                let name = photo.file_name.clone();
-                // 有缩略图用真实图片，否则用色块占位（M0 视觉）
-                let bg_hue = stable_hue(&photo.path.to_string_lossy());
+                let dialog_photo = (*photo).clone();
                 Button::new(("photo", idx))
                     .p(px(0.))
                     .relative()
                     .overflow_hidden()
                     .h(px(150.))
                     .w_full()
-                    .bg(photo_block_bg(bg_hue))
+                    .bg(photo_block_bg(stable_hue(&photo.path.to_string_lossy())))
                     .border_2()
                     .when(is_selected, |b| b.border_color(col(GOLD)))
                     .when(!is_selected, |b| b.border_color(transparent_black()))
-                    .child(
-                        div()
-                            .id(("photocontent", idx))
-                            .size_full()
-                            .items_center()
-                            .justify_center()
-                            .flex().flex_col()
-                            .gap(px(6.))
-                            .child(
-                                div()
-                                    .id(("photoicon", idx))
-                                    .size(px(32.))
-                                    .rounded_full()
-                                    .bg(photo_icon_bg(bg_hue))
-                                    .text_color(rgba(255, 255, 255, 0.95))
-                                    .items_center()
-                                    .justify_center()
-                                    .text_size(px(15.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(location.chars().next().unwrap_or('图').to_string()),
-                            )
-                            .child(
-                                div()
-                                    .id(("photoname", idx))
-                                    .text_size(px(10.))
-                                    .text_color(rgba(255, 255, 255, 0.9))
-                                    .child(name),
-                            ),
-                    )
+                    .child(photo_thumb(photo))
                     .child(
                         div()
                             .id(("photolabel", idx))
@@ -1255,7 +1233,7 @@ impl AppRoot {
                                 cx.notify();
                             });
                         } else {
-                            open_photo_dialog(&app, idx, window, cx);
+                            open_photo_dialog(dialog_photo.clone(), window, cx);
                         }
                     })
             })
@@ -1599,13 +1577,28 @@ impl AppRoot {
                 let id = item.id;
                 let name = item.photo.file_name.clone();
                 let size = item.photo.file_size_label();
+                // 原图已移动到回收站目录，重定向到真实存在的文件，保证大图/按钮可用
+                let mut thumb_photo = item.photo.clone();
+                thumb_photo.path = item.trash_path.clone();
                 let age_days = (crate::core::db::now_millis() - item.trashed_at) / (24 * 60 * 60 * 1000);
                 div()
                     .id(("trash-row", i))
                     .flex().flex_row().items_center().gap(px(12.))
                     .px(px(14.)).py(px(10.))
                     .bg(col(BG_WARM)).rounded_md()
-                    .child(Icon::new(IconName::File).size_4().text_color(col(TEXT_LIGHT)))
+                    .child(
+                        div()
+                            .id(("trash-thumb", i))
+                            .w(px(44.)).h(px(44.))
+                            .flex_none()
+                            .rounded_md()
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .child(photo_thumb(&thumb_photo))
+                            .on_click(move |_ev, window, cx| {
+                                open_photo_dialog(thumb_photo.clone(), window, cx)
+                            }),
+                    )
                     .child(div().w(px(300.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).child(name))
                     .child(div().text_size(px(11.)).text_color(col(TEXT_SECONDARY)).child(size))
                     .child(div().text_size(px(11.)).text_color(col(TEXT_LIGHT)).child(format!("{} 天前", age_days)))
@@ -1842,28 +1835,215 @@ fn stable_id(s: &str) -> usize {
     h as usize
 }
 
-// ===== 照片详情对话框 =====
-fn open_photo_dialog(app: &Entity<AppState>, idx: usize, window: &mut Window, cx: &mut App) {
-    // 取可见列表里的第 idx 张真实照片，并把字段克隆为 owned 以进入 'static 闭包
-    let photo = {
-        let state = app.read(cx);
-        match state.data.visible_photos().get(idx) {
-            Some(p) => (*p).clone(),
-            None => return,
-        }
-    };
+// ===== 照片图片渲染 =====
 
+/// `img()` 能解码的扩展名（与 `Img::extensions()` 对齐，忽略大小写）。
+/// 不支持的格式（HEIC/RAW 等）不喂给 gpui，避免解码失败白屏。
+fn is_decodable_image(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let lower = e.to_ascii_lowercase();
+            Img::extensions().iter().any(|ext| *ext == lower.as_str())
+        })
+        .unwrap_or(false)
+}
+
+/// 网格/列表缩略图源：优先缩略图缓存；缓存缺失时回退到原图（仅可解码格式）。
+fn thumbnail_source(photo: &Photo) -> Option<PathBuf> {
+    if let Some(t) = &photo.thumbnail_path {
+        if t.exists() {
+            return Some(t.clone());
+        }
+    }
+    if photo.path.exists() && is_decodable_image(&photo.path) {
+        return Some(photo.path.clone());
+    }
+    None
+}
+
+/// 详情大图源：优先原图（真正「查看原图」），原图不可解码时回退缩略图缓存。
+fn preview_source(photo: &Photo) -> Option<PathBuf> {
+    if photo.path.exists() && is_decodable_image(&photo.path) {
+        return Some(photo.path.clone());
+    }
+    if let Some(t) = &photo.thumbnail_path {
+        if t.exists() {
+            return Some(t.clone());
+        }
+    }
+    None
+}
+
+/// 无图 / 图片加载中 / 加载失败时的色块占位，保持 M0 视觉。
+fn photo_placeholder(hue: f32, location: &str, name: &str) -> AnyElement {
+    div()
+        .size_full()
+        .flex().flex_col()
+        .items_center().justify_center()
+        .gap(px(6.))
+        .bg(photo_block_bg(hue))
+        .child(
+            div()
+                .size(px(30.))
+                .rounded_full()
+                .bg(photo_icon_bg(hue))
+                .text_color(rgba(255, 255, 255, 0.95))
+                .items_center().justify_center()
+                .text_size(px(14.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(location.chars().next().unwrap_or('图').to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgba(255, 255, 255, 0.9))
+                .child(name.to_string()),
+        )
+        .into_any_element()
+}
+
+/// 照片缩略图元素：优先真实图片（异步加载、Cover 铺满），任何失败都降级到色块。
+/// 元素自身 `size_full()`，调用方需提供有确定尺寸的父容器。
+fn photo_thumb(photo: &Photo) -> AnyElement {
+    let hue = stable_hue(&photo.path.to_string_lossy());
+    let location = photo.location.clone().unwrap_or_default();
     let name = photo.file_name.clone();
+    match thumbnail_source(photo) {
+        Some(path) => {
+            let fb_loc = location.clone();
+            let fb_name = name.clone();
+            let ld_loc = location.clone();
+            let ld_name = name.clone();
+            img(path)
+                .size_full()
+                .object_fit(ObjectFit::Cover)
+                .with_fallback(move || photo_placeholder(hue, &fb_loc, &fb_name))
+                .with_loading(move || photo_placeholder(hue, &ld_loc, &ld_name))
+                .into_any_element()
+        }
+        None => photo_placeholder(hue, &location, &name),
+    }
+}
+
+/// 毫秒时间戳 → 可读日期（UTC）。
+fn format_millis(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// 用系统默认程序打开原图。
+#[cfg(target_os = "windows")]
+fn open_with_default(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+}
+#[cfg(target_os = "macos")]
+fn open_with_default(path: &std::path::Path) {
+    let _ = std::process::Command::new("open").arg(path).spawn();
+}
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn open_with_default(path: &std::path::Path) {
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// 在文件管理器中定位原图。
+#[cfg(target_os = "windows")]
+fn reveal_in_explorer(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+}
+#[cfg(target_os = "macos")]
+fn reveal_in_explorer(path: &std::path::Path) {
+    let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+}
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn reveal_in_explorer(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+    }
+}
+
+// ===== 照片详情对话框 =====
+
+/// 打开照片详情：应用内显示原图大图 + 完整图像信息。
+/// 接受一份 owned Photo，相册库 / 整理结果 / 回收站均可调用。
+fn open_photo_dialog(photo: Photo, window: &mut Window, cx: &mut App) {
+    let name = photo.file_name.clone();
+    let path_str = photo.path.to_string_lossy().to_string();
+    let parent_str = photo
+        .path
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
     let date = photo.date_label();
+    let modified = format_millis(photo.modified_at);
     let size = photo.size_label();
     let file_size = photo.file_size_label();
     let device = photo.device.clone().unwrap_or_else(|| "未知设备".to_string());
     let location = photo.location.clone().unwrap_or_else(|| "未知地点".to_string());
     let tags: Vec<String> = photo.tag_list().into_iter().map(|s| s.to_string()).collect();
-    let hue = stable_hue(&photo.path.to_string_lossy());
-    let has_thumb = photo.thumbnail_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let hash_short: String = photo.content_hash.chars().take(16).collect();
+    let blur = photo
+        .blur_score
+        .map(|v| format!("{:.1}", v))
+        .unwrap_or_else(|| "未分析".to_string());
+    let screenshot = (if photo.is_screenshot { "是" } else { "否" }).to_string();
+    let group = photo
+        .group_id
+        .map(|g| format!("#{}", g))
+        .unwrap_or_else(|| "无".to_string());
+    let phash = photo
+        .phash
+        .map(|h| format!("{:016X}", h))
+        .unwrap_or_else(|| "—".to_string());
+    let gps = match (photo.gps_lat_wgs84, photo.gps_lon_wgs84) {
+        (Some(lat), Some(lon)) => format!("{:.5}, {:.5}", lat, lon),
+        _ => "未采集".to_string(),
+    };
+    let thumb_state = photo
+        .thumbnail_path
+        .as_ref()
+        .filter(|p| p.exists())
+        .map(|_| "已缓存".to_string())
+        .unwrap_or_else(|| "无缓存".to_string());
+    let hue = stable_hue(&path_str);
 
-    let preview_hint = if has_thumb { "已生成缩略图缓存" } else { "暂无缩略图" };
+    let big_path = preview_source(&photo);
+    let is_original = big_path.as_ref().map(|p| *p == photo.path).unwrap_or(false);
+    let preview_hint = match &big_path {
+        Some(_) if is_original => "原图预览 · 完整显示".to_string(),
+        Some(_) => "缩略图预览（原图不可解码或已移动）".to_string(),
+        None => "无法预览（缺少可解码的图片文件）".to_string(),
+    };
+
+    let open_path = photo.path.clone();
+    let reveal_path = photo.path.clone();
+
+    // 大图元素工厂：dialog 每次重绘都会调用，因此必须是可重复调用的 Fn。
+    let make_big = {
+        let big_loc = location.clone();
+        let big_name = name.clone();
+        move || -> AnyElement {
+            match &big_path {
+                Some(path) => {
+                    let l1 = big_loc.clone();
+                    let n1 = big_name.clone();
+                    let l2 = big_loc.clone();
+                    let n2 = big_name.clone();
+                    img(path.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::Contain)
+                        .with_fallback(move || photo_placeholder(hue, &l1, &n1))
+                        .with_loading(move || photo_placeholder(hue, &l2, &n2))
+                        .into_any_element()
+                }
+                None => photo_placeholder(hue, &big_loc, &big_name),
+            }
+        }
+    };
+
     window.open_dialog(cx, move |dialog: Dialog, _w, _cx| {
         let build_tags = || {
             tags.iter()
@@ -1882,10 +2062,18 @@ fn open_photo_dialog(app: &Entity<AppState>, idx: usize, window: &mut Window, cx
                 })
                 .collect::<Vec<AnyElement>>()
         };
+
+        let p_open = open_path.clone();
+        let open_btn = dialog_btn(IconName::Frame, "打开原图", PRIMARY)
+            .on_click(move |_ev, _w, _cx| open_with_default(&p_open));
+        let p_reveal = reveal_path.clone();
+        let reveal_btn = dialog_btn(IconName::FolderOpen, "所在文件夹", TEXT_SECONDARY)
+            .on_click(move |_ev, _w, _cx| reveal_in_explorer(&p_reveal));
+
         dialog
             .title(format!("照片详情 · {}", name))
-            .w(px(880.))
-            .h(px(540.))
+            .w(px(940.))
+            .h(px(600.))
             .py(px(16.))
             .child(
                 div()
@@ -1897,68 +2085,67 @@ fn open_photo_dialog(app: &Entity<AppState>, idx: usize, window: &mut Window, cx
                         div()
                             .id("dialog-image")
                             .flex_1()
+                            .min_w_0()
                             .min_h_0()
-                            .items_center()
-                            .justify_center()
+                            .flex().flex_col()
                             .bg(col(BG_WARM))
                             .rounded_md()
+                            .overflow_hidden()
                             .child(
                                 div()
-                                    .id("dialog-preview")
-                                    .size(px(340.))
-                                    .rounded_lg()
-                                    .bg(photo_block_bg(hue))
-                                    .items_center()
-                                    .justify_center()
-                                    .flex().flex_col()
-                                    .gap(px(10.))
-                                    .child(
-                                        div()
-                                            .id("dialog-loc")
-                                            .text_size(px(18.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgba(255, 255, 255, 0.95))
-                                            .child(location.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("dialog-sim")
-                                            .text_size(px(12.))
-                                            .text_color(rgba(255, 255, 255, 0.75))
-                                            .child(preview_hint),
-                                    ),
+                                    .id("dialog-image-area")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .p(px(10.))
+                                    .child(make_big()),
+                            )
+                            .child(
+                                div()
+                                    .id("dialog-preview-hint")
+                                    .text_size(px(11.))
+                                    .text_color(col(TEXT_SECONDARY))
+                                    .px(px(12.))
+                                    .py(px(6.))
+                                    .child(preview_hint.clone()),
                             ),
                     )
                     .child(
                         div()
                             .id("dialog-info")
-                            .w(px(300.))
-                            .min_w(px(300.))
+                            .w(px(320.))
+                            .min_w(px(320.))
                             .px(px(20.))
                             .py(px(12.))
                             .border_l_1()
                             .border_color(col(BORDER_LIGHT))
                             .overflow_y_scroll()
                             .flex().flex_col()
+                            .child(section_title("基本信息"))
                             .child(info_row("文件名", name.clone()))
                             .child(info_row("拍摄日期", date.clone()))
+                            .child(info_row("修改时间", modified.clone()))
                             .child(info_row("尺寸", size.clone()))
                             .child(info_row("文件大小", file_size.clone()))
                             .child(info_row("设备", device.clone()))
                             .child(info_row("地点", location.clone()))
-                            .child(info_tag_section("🏷️ 标签", build_tags()))
+                            .child(info_block("所在目录", parent_str.clone()))
+                            .child(info_tag_section("标签", build_tags()))
+                            .child(section_title("分析结果"))
+                            .child(info_row("模糊评分", blur.clone()))
+                            .child(info_row("截图", screenshot.clone()))
+                            .child(info_row("相似组", group.clone()))
+                            .child(info_row("感知哈希", phash.clone()))
+                            .child(info_row("GPS", gps.clone()))
+                            .child(section_title("索引"))
+                            .child(info_row("内容哈希", hash_short.clone()))
+                            .child(info_row("缩略图", thumb_state.clone()))
                             .child(
                                 div()
                                     .id("dialog-actions")
                                     .mt_4()
                                     .flex().flex_row()
                                     .gap(px(6.))
-                                    .children(vec![
-                                        dialog_btn(IconName::Star, "收藏", PRIMARY),
-                                        dialog_btn(IconName::Info, "标签", TEXT_SECONDARY),
-                                        dialog_btn(IconName::FolderOpen, "移动", TEXT_SECONDARY),
-                                        dialog_btn(IconName::Delete, "", DANGER),
-                                    ]),
+                                    .children(vec![open_btn, reveal_btn]),
                             ),
                     ),
             )
@@ -1973,9 +2160,32 @@ fn info_row(label: &'static str, value: impl Into<SharedString>) -> AnyElement {
     div()
         .flex().flex_row()
         .justify_between()
+        .gap(px(12.))
         .py(px(6.))
-        .child(div().text_color(col(TEXT_SECONDARY)).child(label))
+        .child(div().flex_none().text_color(col(TEXT_SECONDARY)).child(label))
         .child(div().text_color(col(PRIMARY)).font_weight(FontWeight::MEDIUM).child(value.into()))
+        .into_any_element()
+}
+
+/// 竖排信息块，用于较长的值（如完整目录路径）。
+fn info_block(label: &'static str, value: impl Into<SharedString>) -> AnyElement {
+    div()
+        .flex().flex_col()
+        .gap(px(2.))
+        .py(px(6.))
+        .child(div().text_size(px(11.)).text_color(col(TEXT_SECONDARY)).child(label))
+        .child(div().text_size(px(11.)).text_color(col(PRIMARY)).child(value.into()))
+        .into_any_element()
+}
+
+fn section_title(text: &'static str) -> AnyElement {
+    div()
+        .mt_3()
+        .mb(px(4.))
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(col(PRIMARY_LIGHTER))
+        .child(text.to_owned())
         .into_any_element()
 }
 
