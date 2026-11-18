@@ -65,8 +65,6 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_photos_hash ON photos(content_hash);
         CREATE INDEX IF NOT EXISTS idx_photos_date ON photos(date_taken);
         CREATE INDEX IF NOT EXISTS idx_photos_root ON photos(scan_root_id);
-        CREATE INDEX IF NOT EXISTS idx_photos_blur ON photos(blur_score);
-        CREATE INDEX IF NOT EXISTS idx_photos_group ON photos(group_id);
 
         CREATE TABLE IF NOT EXISTS photo_groups (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +98,17 @@ fn migrate(conn: &Connection) -> Result<()> {
         add("phash", "ALTER TABLE photos ADD COLUMN phash INTEGER")?;
         add("group_id", "ALTER TABLE photos ADD COLUMN group_id INTEGER")?;
     }
+
+    // 分析列上的索引必须在补列之后创建：M1 老库此时才刚拿到这些列，
+    // 若放在第一个 execute_batch 里会因 "no such column" 导致整个迁移失败。
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_photos_blur ON photos(blur_score);
+        CREATE INDEX IF NOT EXISTS idx_photos_group ON photos(group_id);
+        ",
+    )
+    .context("创建分析索引失败")?;
+
     Ok(())
 }
 
@@ -508,5 +517,82 @@ mod tests {
         assert_eq!(p.file_size_label(), "2.0 MB");
         assert_eq!(p.date_label(), "2024-08-15 09:45:00");
         assert_eq!(p.tag_list(), vec!["旅行", "风景"]);
+    }
+
+    /// 回归：模拟 M1 老库（无分析列/无 photo_groups/无分析索引）升级到 M2。
+    /// 迁移必须在补列之后才建分析列索引，否则老库会因 "no such column" 整体失败。
+    #[test]
+    fn migrates_legacy_m1_database() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE scan_roots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                last_scanned_at INTEGER NOT NULL DEFAULT 0,
+                photo_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE photos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                file_name TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                date_taken TEXT,
+                modified_at INTEGER NOT NULL,
+                width INTEGER NOT NULL DEFAULT 0,
+                height INTEGER NOT NULL DEFAULT 0,
+                device TEXT,
+                location TEXT,
+                tags TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL DEFAULT '',
+                thumbnail_path TEXT,
+                gps_lon_wgs84 REAL,
+                gps_lat_wgs84 REAL,
+                scan_root_id INTEGER REFERENCES scan_roots(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_photos_path ON photos(path);
+            CREATE INDEX idx_photos_hash ON photos(content_hash);
+            CREATE INDEX idx_photos_date ON photos(date_taken);
+            CREATE INDEX idx_photos_root ON photos(scan_root_id);
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO photos (path, file_name, size_bytes, date_taken, modified_at,
+                                width, height, device, tags, content_hash)
+                VALUES ('/old/IMG_0001.jpg', 'IMG_0001.jpg', 1234,
+                        '2024-01-01 00:00:00', 100, 100, 100, 'OldCam', '', 'oldhash');
+            ",
+        )?;
+
+        // 关键：老库迁移不应失败。
+        migrate(&conn)?;
+
+        // 老数据保留，新增字段取默认值。
+        let photos = list_photos(&conn)?;
+        assert_eq!(photos.len(), 1);
+        let p = &photos[0];
+        assert_eq!(p.file_name, "IMG_0001.jpg");
+        assert_eq!(p.blur_score, None);
+        assert!(!p.is_screenshot);
+        assert_eq!(p.phash, None);
+        assert_eq!(p.group_id, None);
+
+        // 分析列索引与 photo_groups 表已建立。
+        let idx: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA index_list(photos)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        assert!(idx.contains(&"idx_photos_blur".to_string()));
+        assert!(idx.contains(&"idx_photos_group".to_string()));
+        let groups: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='photo_groups'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(groups, 1);
+
+        // 幂等：重复迁移不报错。
+        migrate(&conn)?;
+        Ok(())
     }
 }

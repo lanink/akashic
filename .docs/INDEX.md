@@ -89,7 +89,7 @@ ai-workflow ──> 约束所有 Agent 对以上模块的读取与文档更新
 | --- | --- | --- | --- |
 | ui-desktop | 379e4b66b661 | valid | AI 生成未审 |
 | core-model | d4a4d0c6ed02 | valid | AI 生成未审 |
-| core-scanner | 50186e77ef05 | valid | AI 生成未审 |
+| core-scanner | ccc23cfc4f5c | valid | AI 生成未审 |
 | core-analyze | f49408cd46d5 | valid | AI 生成未审 |
 | design-prototype | d32b2f6af661 | valid | AI 生成未审 |
 | product-spec | 2df241d5d3bf | valid | AI 生成未审 |

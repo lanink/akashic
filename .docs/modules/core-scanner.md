@@ -1,8 +1,8 @@
 # 模块：core-scanner
 
-> 生成时间：2026-11-18 15:40 +0800
+> 生成时间：2026-11-18 15:50 +0800
 > 覆盖范围：src/core/db.rs, src/core/scanner.rs, src/core/thumbnail.rs（按路径排序）
-> 覆盖 hash：50186e77ef05（取前 12 位，由生成者用命令行工具计算）
+> 覆盖 hash：ccc23cfc4f5c（取前 12 位，由生成者用命令行工具计算）
 > 可信度：AI 生成未审
 > 状态：valid
 
@@ -34,7 +34,7 @@
 2. 扫描结束 → `sweep_photos` 删除此根目录下不在本次存活集合的记录 → 提交事务 → 上报 `Finished{stats}`。
 3. `upsert_photo` 以 (path, size_bytes, modified_at) 判断是否需要更新，实现增量。
 4. schema 含 `scan_roots`/`photos`/`settings` 三表与索引，M2 新增 `photo_groups` 表与 `photos` 的 `blur_score/is_screenshot/phash/group_id` 四列；`photos.scan_root_id` 外键级联删除；WAL 模式。
-5. M2 迁移：新库建表即含新列；老库在 `migrate` 中用 `PRAGMA table_info(photos)` 检查后按需 `ALTER TABLE ADD COLUMN`，避免重复 ALTER 报错。查询统一用 `PHOTO_COLUMNS` 显式列清单（不用 `SELECT *`）以稳定列顺序。
+5. M2 迁移分三阶段：①第一个 `execute_batch` 只建表 + 旧列索引；②用 `PRAGMA table_info(photos)` 检查后按需 `ALTER TABLE ADD COLUMN` 补齐 4 个分析列；③**补列之后**再单独 `execute_batch` 建 `idx_photos_blur`/`idx_photos_group`。查询统一用 `PHOTO_COLUMNS` 显式列清单（不用 `SELECT *`）以稳定列顺序。
 6. `upsert_photo` 在照片内容变化（size/mtime 变更）时清空blur_score/is_screenshot/phash/group_id，令分析结果失效待重算。
 
 ## 依赖关系
@@ -50,10 +50,12 @@
 ## 已知风险 / 易错点
 - **嵌套事务**：`sweep_photos` 不可再开事务，因调用方 `scan_root` 已持有 `unchecked_transaction`；曾因此导致增量清理静默失败。
 - `row_to_photo` 用列位置索引，schema 加列必须同步位置，否则数据错位。
+- **索引创建顺序**：引用新列的索引必须放在补列之后；曾因把 `idx_photos_blur`/`idx_photos_group` 放进第一个 `execute_batch`，导致 M1 老库（无这些列）打开时报 `no such column` → "迁移 schema 失败"。回归测试 `migrates_legacy_m1_database` 覆盖此场景。
 - Windows 上 SQLite 连接未 drop 时临时目录无法删除，测试中需显式 `drop(conn)`。
 - M0 遗留的 `delete_scan_root` 会级联删除其下照片记录（外键 ON DELETE CASCADE）。
 - HEIC/HEIF 在 `IMAGE_EXTS` 中会被索引元数据，但 `image` 无法解码生成缩略图（本期无 HEIC 支持，属预期）。
 
 ## 变更记录
+- 2026-11-18 15:50：修复 M1 老库升级失败——把分析列索引创建移到补列之后，新增老库升级回归测试，刷新 hash。
 - 2026-11-18 15:40：M2 新增 photo_groups 表与 4 个分析列的迁移、分析结果读写 Repository、PHOTO_COLUMNS 显式列清单、upsert 时清空旧分析，刷新 hash。
 - 2026-11-18 15:10：M1 新建模块，实现 SQLite 索引、递归扫描、EXIF、内容哈希、增量更新与缩略图缓存。
