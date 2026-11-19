@@ -7,7 +7,8 @@
 > 更新时间：2026-11-18 15:40 +0800（M2 完成：模糊评分/截图识别/大文件排序/相似归组，后台分析调度，整理页 4 工具接真实结果列表）  
 > 更新时间：2026-11-18 16:05 +0800（M3 完成：批量删除到回收站/恢复/清空/30 天清理、批量重命名模板引擎+预览+一次撤销、操作日志，新增重命名页与回收站页）  
 > 更新时间：2026-11-18 16:35 +0800（补充修复：所有照片展示位接入 gpui `img(PathBuf)` 真实缩略图，详情弹窗升级为原图大图 + 完整图像信息；提前完成 M1/M2/M3 遗留的「待 M5 接 `img()`」项）
-> 更新时间：2026-11-18 16:58 +0800（M4 完成：4 种归档规则 / 移动·复制 / 完整目录树预览 / 撤销，新增归档页与 core-ops 归档引擎，整理页卡片与侧栏徽标接真实数据）
+> 更新时间：2026-11-18 16:58 +0800（M4 完成：4 种归档规则 / 移动·复制 / 完整目录树预览 / 撤销，新增归档页与 core-ops 归档引擎，整理页卡片与侧栏徽标接真实数据）  
+> 更新时间：2026-11-19 08:30 +0800（M5 完成：首页真实统计/进度/最近操作与加载·空·错误态、设置与隐私中心、可配置回收站保留期、窗口自适应与最小尺寸、图标 47/47 全登记、清理 M0 模拟数据、readme 重写；41 个测试通过）  
 > 文档性质：规划文档，非 `.docs/modules/` 下的派生缓存；不参与覆盖 hash 校验。  
 > 依据：`design.md`（PRD v1）与 2026-11-16 的源码现状（见 `.docs/INDEX.md`）。
 
@@ -24,7 +25,7 @@
 1. 软件定位为**个人本地使用**，不做商业分发；imageflow 的 AGPLv3 许可证可接受。
 2. imageflow 以**固定 commit 的 git submodule** 引入，固定 `7cbe26be`。
 3. 目标照片**不含 iPhone HEIC**，本期不引入 HEIC 解码依赖。
-4. 桌面优先，沿用现有 gpui 1200×780 窗口与 5 项侧栏导航；PRD 中的“4 个底部 Tab”在桌面端映射为侧栏入口。
+4. 桌面优先，沿用现有 gpui 1200×780 窗口与 5 项侧栏导航；PRD 中的“4 个底部 Tab”在桌面端映射为侧栏入口。（M5 已调整：窗口改为 `.size_full()` 跟随 + `window_min_size 960×640`，侧栏扩为 7 项含归档/设置。）
 5. 纯本地运行，索引、缩略图、操作日志、照片坐标都存放在本机应用数据目录，不上传任何照片或位置数据。
 6. 所有批量操作遵循 PRD 的“筛选 → 预览 → 确认（可撤销）”，删除一律先进入回收站，不做永久删除。
 7. 性能目标按目标用户“5000+ 张照片”设定，扫描与分类必须在后台线程执行，UI 不阻塞。
@@ -177,11 +178,13 @@ OxiGeo 可行性结论：**可以做，但不是照片足迹的核心依赖**。
 
 说明：独立桌面应用不属于 WorkBuddy 的代理免 key 场景，需自行到腾讯位置服务开放平台申请 key，配置 Referer 白名单并把占位符 `key="Please apply for your own key at Tencent Location Service Open Platform and replace this placeholder"` 替换为自己的 key；不得使用 Google/Apple/Bing/Mapbox/OSM 等未合规地图源。
 
-### M5 · 首页与体验闭环
+### M5 · 首页与体验闭环 — 已完成（2026-11-19）
 
 任务：首页统计、整理进度、最近操作改为真实数据；补齐加载态、空态、错误态；设置/隐私中心页面；清理 `Assets::load` 中未使用或缺失的图标注册；去掉硬编码 1200×780 的强绑定，设置合理最小尺寸。（缩略图真图与详情原图预览已在 16:35 补充修复中提前完成，本里程碑聚焦其余体验项。）
 
 验收：全应用不再出现模拟数字；离线状态下所有功能可用；readme.md 可让新人独立跑起来。
+
+> **实际交付（2026-11-19）**：**core**——`model.rs` 删除 M0 模拟数据（`PhotoDef`/`PHOTOS`/`FolderNode`/`folder_defs()`/`expandable_id`）并改模块头注释，`OpKind` 新增 `label()` 中文展示名与 roundtrip 单测；`trash.rs` 新增 `DEFAULT_RETENTION_DAYS=30`、`retention_days(conn)`（读 `settings.trash.retention_days`，非法/越界回退默认）、`set_retention_days(conn, days)`（1..=3650 校验），新增 `tests/settings_test.rs` 4 个用例（默认值/往返/脏值回退/越界拒绝）。**UI**——`AppState` 增 `load_error/last_error/retention_days`，扫描/分析失败写入 `last_error`、成功清空；新增 `Page::Settings` + 侧栏入口 + `page_settings`（本机 5 条 `Paths` 路径与打开数据目录、保留期 7/30/90 按钮即时写库、真实数据概况、隐私说明、关于）；`page_home` 重写为 4 张真实统计卡 + 整理进度（4 类分析数 + 后台状态）+ 最近 6 条操作日志（`OpKind::label()` + 时间 + 数量 + 详情）+ 加载/空/错误态横幅，`subtitle_for_home` 加状态；回收站「清理 N 天前」按钮与说明跟随 `retention_days`；新增 `human_size`/`truncate` helper。**窗口**——`main.rs` 设 `window_min_size = 960×640`，`windowcard` 由 `.w(1200.).h(780.)` 改 `.size_full()`，去掉硬编码强绑定。**图标**——`assets.rs` 从 22 个登记补齐到 47 个 SVG 全登记（校验 files=47 / registered=47 / missing=0 / extra=0）。**文档**——`readme.md` 由 4 行占位重写为可独立上手文档（环境/submodule/构建·运行·测试/首次使用/数据目录/文档导航/已知限制）；全仓扫描确认无 `1200|780|PHOTOS|folder_defs|M0 模拟|"12"` 残留。**验证**：`cargo check` 通过；`cargo test` 41 个全绿（22 单元 + 2 analyze + 6 archive + 5 ops + 4 settings + 2 scanner）；`cargo build` 成功（54MB）；10 个模块文档覆盖 hash 全量校验 valid。**偏差与遗留**：① 保留期提供 7/30/90 三个预设按钮（core 支持 1..=3650 任意值，但未做自由输入）；② 设置即时写库，无「保存/取消」二次确认；③ 错误横幅只在首页与设置页展示，其他页面仍依赖 `scan_status/ops_status` 文本；④ 窗口最小尺寸固定 960×640，未做 DPI/多显示器自适应；⑤ 未做 GUI 冒烟（无交互环境）；⑥ `design.md` 头部状态与交付物清单仍未刷新，留 M6。已同步 core-model/core-ops/ui-desktop/icon-assets/product-spec 模块 md 与 INDEX/DEV_PLAN。
 
 ### M6 · 打磨与交付
 

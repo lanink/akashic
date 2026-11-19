@@ -15,6 +15,40 @@ use super::{move_file, unique_dest};
 /// 回收站文件名的前缀，用于还原时识别。
 const TRASH_PREFIX: &str = "trash_";
 
+/// 回收站默认保留天数（未设置或设置非法时回退）。
+pub const DEFAULT_RETENTION_DAYS: i64 = 30;
+/// 允许设置的保留天数下限。
+pub const RETENTION_MIN_DAYS: i64 = 1;
+/// 允许设置的保留天数上限。
+pub const RETENTION_MAX_DAYS: i64 = 3650;
+/// 保留天数在 settings 表中的键。
+pub const RETENTION_SETTING_KEY: &str = "trash.retention_days";
+
+/// 读取用户设置的回收站保留天数；未设置、无法解析或越界时回退到默认 30 天。
+pub fn retention_days(conn: &Connection) -> i64 {
+    match db::get_setting(conn, RETENTION_SETTING_KEY) {
+        Ok(Some(v)) => v
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|d| (RETENTION_MIN_DAYS..=RETENTION_MAX_DAYS).contains(d))
+            .unwrap_or(DEFAULT_RETENTION_DAYS),
+        _ => DEFAULT_RETENTION_DAYS,
+    }
+}
+
+/// 写入回收站保留天数；超出 1..=3650 时返回错误且不写库。
+pub fn set_retention_days(conn: &Connection, days: i64) -> Result<()> {
+    if !(RETENTION_MIN_DAYS..=RETENTION_MAX_DAYS).contains(&days) {
+        anyhow::bail!(
+            "保留天数需在 {}..{} 之间",
+            RETENTION_MIN_DAYS,
+            RETENTION_MAX_DAYS
+        );
+    }
+    db::set_setting(conn, RETENTION_SETTING_KEY, &days.to_string())
+}
+
 /// 把若干照片移动到回收站（不永久删除）。
 ///
 /// 流程：逐张把文件 rename 到 `paths.trash_dir`（冲突自动加后缀）→ 记录一条

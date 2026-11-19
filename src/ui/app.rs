@@ -52,6 +52,7 @@ enum Page {
     Rename,
     Archive,
     Trash,
+    Settings,
 }
 
 // ===== 照片缩略图配色 =====
@@ -103,6 +104,12 @@ pub struct AppState {
     archive_scope_all: bool,
     archive_plan: Option<ArchivePlan>,
     last_archive_op: Option<i64>,
+    /// M5 启动/刷新索引失败信息（错误态横幅）
+    load_error: Option<String>,
+    /// M5 最近一次后台任务失败信息（错误态横幅）
+    last_error: Option<String>,
+    /// M5 回收站保留天数，设置页可改并持久化到 settings
+    retention_days: i64,
 }
 
 /// 整理页的 4 个分析工具。
@@ -125,19 +132,25 @@ impl AppState {
             let mut archive_dest = PathBuf::new();
             let mut archive_rule = ArchiveRule::default();
             let mut archive_mode = ArchiveMode::default();
-            if let Ok(conn) = crate::core::db::open(&db_path) {
-                data = LibraryData::reload(&conn).unwrap_or_default();
-                analyze_data = AnalyzeData::reload(&conn).unwrap_or_default();
-                ops_data = OpsData::reload(&conn).unwrap_or_default();
-                if let Some(v) = crate::core::db::get_setting(&conn, "archive.dest").ok().flatten() {
-                    archive_dest = PathBuf::from(v);
+            let mut retention_days = ops_trash::DEFAULT_RETENTION_DAYS;
+            let mut load_error: Option<String> = None;
+            match crate::core::db::open(&db_path) {
+                Ok(conn) => {
+                    data = LibraryData::reload(&conn).unwrap_or_default();
+                    analyze_data = AnalyzeData::reload(&conn).unwrap_or_default();
+                    ops_data = OpsData::reload(&conn).unwrap_or_default();
+                    if let Some(v) = crate::core::db::get_setting(&conn, "archive.dest").ok().flatten() {
+                        archive_dest = PathBuf::from(v);
+                    }
+                    if let Some(v) = crate::core::db::get_setting(&conn, "archive.rule").ok().flatten() {
+                        archive_rule = ArchiveRule::from_str(&v);
+                    }
+                    if let Some(v) = crate::core::db::get_setting(&conn, "archive.mode").ok().flatten() {
+                        archive_mode = ArchiveMode::from_str(&v);
+                    }
+                    retention_days = ops_trash::retention_days(&conn);
                 }
-                if let Some(v) = crate::core::db::get_setting(&conn, "archive.rule").ok().flatten() {
-                    archive_rule = ArchiveRule::from_str(&v);
-                }
-                if let Some(v) = crate::core::db::get_setting(&conn, "archive.mode").ok().flatten() {
-                    archive_mode = ArchiveMode::from_str(&v);
-                }
+                Err(e) => load_error = Some(format!("索引库打开失败：{e}")),
             }
             let mut s = Self {
                 page: Page::Library,
@@ -166,18 +179,25 @@ impl AppState {
                 archive_scope_all: true,
                 archive_plan: None,
                 last_archive_op: None,
+                load_error,
+                last_error: None,
+                retention_days,
             };
             s.refresh_archive_plan();
             s
         })
     }
 
-    /// 统一刷新三个数据快照（批量操作后调用）。
+    /// 统一刷新三个数据快照（批量操作后调用）；失败时记录错误态。
     fn reload_all(&mut self) {
-        if let Ok(conn) = crate::core::db::open(&self.paths.db_path) {
-            self.data = LibraryData::reload(&conn).unwrap_or_default();
-            self.analyze_data = AnalyzeData::reload(&conn).unwrap_or_default();
-            self.ops_data = OpsData::reload(&conn).unwrap_or_default();
+        match crate::core::db::open(&self.paths.db_path) {
+            Ok(conn) => {
+                self.data = LibraryData::reload(&conn).unwrap_or_default();
+                self.analyze_data = AnalyzeData::reload(&conn).unwrap_or_default();
+                self.ops_data = OpsData::reload(&conn).unwrap_or_default();
+                self.load_error = None;
+            }
+            Err(e) => self.load_error = Some(format!("刷新索引失败：{e}")),
         }
     }
 
@@ -487,12 +507,14 @@ impl AppState {
                                     );
                                     this.is_scanning = false;
                                     this.progress_rx = None;
+                                    this.last_error = None;
                                     done = true;
                                     // 扫描完成后自动触发 M2 分析
                                     this.start_analysis(cx);
                                 }
                                 ScanProgress::Failed { message } => {
                                     this.scan_status = format!("扫描失败：{message}");
+                                    this.last_error = Some(format!("扫描失败：{message}"));
                                     this.is_scanning = false;
                                     this.progress_rx = None;
                                     done = true;
@@ -583,10 +605,12 @@ impl AppState {
                                     );
                                     this.is_analyzing = false;
                                     this.analyze_rx = None;
+                                    this.last_error = None;
                                     done = true;
                                 }
                                 AnalyzeProgress::Failed { message } => {
                                     this.analyze_status = format!("分析失败：{message}");
+                                    this.last_error = Some(format!("分析失败：{message}"));
                                     this.is_analyzing = false;
                                     this.analyze_rx = None;
                                     done = true;
@@ -681,9 +705,8 @@ impl Render for AppRoot {
             .child(
                 div()
                     .id("windowcard")
-                    .w(px(1200.))
-                    .h(px(780.))
-                    .max_h_full()
+                    // 跟随窗口尺寸（main.rs 只给初始尺寸与最小尺寸），不再硬编码 1200×780
+                    .size_full()
                     .flex().flex_col()
                     .overflow_hidden()
                     .rounded_lg()
@@ -786,22 +809,6 @@ impl AppRoot {
             btn.into_any_element()
         };
 
-        let setting_btn = Button::new("nav-settings")
-            .ghost()
-            .w_full()
-            .justify_start()
-            .px(px(16.))
-            .py(px(10.))
-            .gap(px(12.))
-            .rounded_md()
-            .border_l_3()
-            .border_color(transparent_black())
-            .icon(IconName::Settings)
-            .label("设置")
-            .text_color(rgba(255, 255, 255, 0.5))
-            .on_click(|_ev, _w, _cx| {})
-            .into_any_element();
-
         div()
             .id("sidebar")
             .w(px(200.))
@@ -836,7 +843,7 @@ impl AppRoot {
                 },
             ))
             .child(div().id("sidebar-divider").h(px(1.)).my(px(12.)).mx(px(20.)).bg(rgba(255, 255, 255, 0.06)))
-            .child(setting_btn)
+            .child(nav(Page::Settings, IconName::Settings, "设置", None))
             .child(
                 div()
                     .id("sidebar-footer")
@@ -866,11 +873,13 @@ impl AppRoot {
             Page::Rename => self.page_rename(state).into_any_element(),
             Page::Archive => self.page_archive(state).into_any_element(),
             Page::Trash => self.page_trash(state).into_any_element(),
+            Page::Settings => self.page_settings(state).into_any_element(),
         }
     }
 }
 
 impl AppRoot {
+    // ===== 首页 =====
     // ===== 首页 =====
     fn page_home(&self, state: &AppState) -> impl IntoElement + 'static {
         let app = &self.app;
@@ -878,13 +887,7 @@ impl AppRoot {
         let total = state.data.total_count;
         let total_bytes = state.data.total_bytes;
         let root_count = state.data.root_count;
-        let size_text = if total_bytes >= 1024 * 1024 * 1024 {
-            format!("{:.1} GB", total_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-        } else if total_bytes >= 1024 * 1024 {
-            format!("{:.1} MB", total_bytes as f64 / (1024.0 * 1024.0))
-        } else {
-            format!("{} KB", total_bytes / 1024)
-        };
+        let size_text = human_size(total_bytes);
         let stats: Vec<(String, &'static str, u32)> = vec![
             (format!("{}", total), "总照片", PRIMARY),
             (size_text.clone(), "占用空间", PRIMARY),
@@ -916,35 +919,171 @@ impl AppRoot {
                 )
         });
 
-        let records: Vec<(&'static str, String)> = if state.data.loaded {
-            vec![
-                ("索引状态", format!("已建立 · {} 个目录", root_count)),
-                ("照片总数", format!("{} 张", total)),
-                ("占用空间", size_text.clone()),
-                ("最近扫描", if root_count > 0 { "索引已就绪".to_string() } else { "尚未扫描".to_string() }),
-            ]
-        } else {
-            vec![
-                ("索引状态", "尚未建立".to_string()),
-                ("提示", "前往相册库选择目录".to_string()),
-                ("整理工具", "扫描后自动解锁".to_string()),
-                ("隐私", "100% 本地 · 零上传".to_string()),
-            ]
-        };
-        let record_rows = records.into_iter().enumerate().map(|(ri, (a, b))| {
+        // 状态横幅：错误态 > 加载态 > 隐藏
+        let banner: AnyElement = if let Some(err) =
+            state.load_error.as_ref().or(state.last_error.as_ref())
+        {
             div()
-                .id(("record", ri))
-                .flex_1()
-                .flex().flex_row()
-                .justify_between()
+                .id("home-banner")
+                .mb(px(14.))
                 .px(px(14.))
                 .py(px(10.))
-                .bg(col(BG_WARM))
                 .rounded_md()
-                .text_size(px(13.))
-                .child(div().text_color(col(TEXT_SECONDARY)).child(a))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(b))
-        });
+                .bg(rgba(0xE0, 0x54, 0x4C, 0.10))
+                .text_size(px(12.))
+                .text_color(col(DANGER))
+                .child(format!("⚠ {err}"))
+                .into_any_element()
+        } else if state.is_scanning || state.is_analyzing {
+            let text = if state.is_scanning {
+                state.scan_status.clone()
+            } else {
+                state.analyze_status.clone()
+            };
+            div()
+                .id("home-banner")
+                .mb(px(14.))
+                .px(px(14.))
+                .py(px(10.))
+                .rounded_md()
+                .bg(col(GOLD_PALE))
+                .text_size(px(12.))
+                .text_color(col(PRIMARY))
+                .child(format!("⏳ {text}"))
+                .into_any_element()
+        } else {
+            div().id("home-banner-none").into_any_element()
+        };
+
+        // 整理进度：真实分析结果 + 后台分析状态
+        let a = &state.analyze_data;
+        let progress_text = if state.is_analyzing {
+            state.analyze_status.clone()
+        } else if !state.analyze_status.is_empty() {
+            state.analyze_status.clone()
+        } else if a.is_ready() {
+            format!("已完成 {} 张照片的分析 · 结果来自本地索引", a.analyzed_count)
+        } else {
+            "尚未分析 · 扫描目录后自动开始".to_string()
+        };
+        let progress_items: Vec<(String, &'static str)> = vec![
+            (format!("{}", a.groups.len()), "相似组"),
+            (format!("{}", a.blurry.len()), "疑似模糊"),
+            (format!("{}", a.screenshots.len()), "截图"),
+            (format!("{}", a.large.len()), "大文件"),
+        ];
+        let progress_row = div()
+            .id("home-progress")
+            .flex().flex_row()
+            .gap(px(10.))
+            .children(
+                progress_items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (v, label))| {
+                        div()
+                            .id(("home-progress-item", i))
+                            .flex_1()
+                            .bg(col(BG_WARM))
+                            .rounded_md()
+                            .px(px(12.))
+                            .py(px(10.))
+                            .child(
+                                div()
+                                    .text_size(px(18.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(col(GOLD))
+                                    .child(v),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(col(TEXT_SECONDARY))
+                                    .child(label.to_owned()),
+                            )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+
+        // 最近整理记录：来自 op_log 的真实批量操作（空态给出引导）
+        let recent_ops = state.ops_data.recent_ops.clone();
+        let records_body: AnyElement = if recent_ops.is_empty() {
+            div()
+                .id("home-records-empty")
+                .flex().flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .py(px(24.))
+                .child(Icon::new(IconName::Info).size(px(32.)).text_color(col(BORDER_LIGHT)))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(col(TEXT_SECONDARY))
+                        .child("还没有整理记录"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(col(TEXT_LIGHT))
+                        .child("扫描目录并完成一次整理后，操作会记录在这里"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("home-records-list")
+                .flex().flex_col()
+                .gap(px(6.))
+                .children(
+                    recent_ops
+                        .iter()
+                        .take(6)
+                        .enumerate()
+                        .map(|(i, op)| {
+                            div()
+                                .id(("home-record", i))
+                                .flex().flex_row()
+                                .items_center()
+                                .gap(px(12.))
+                                .px(px(12.))
+                                .py(px(9.))
+                                .bg(col(BG_WARM))
+                                .rounded_md()
+                                .child(
+                                    div()
+                                        .w(px(132.))
+                                        .flex_none()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(col(PRIMARY))
+                                        .child(op.kind.label().to_owned()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(12.))
+                                        .text_color(col(GOLD))
+                                        .child(format!("{} 张", op.item_count)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(11.))
+                                        .text_color(col(TEXT_SECONDARY))
+                                        .child(truncate(&op.detail, 42)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.))
+                                        .text_color(col(TEXT_LIGHT))
+                                        .child(format_millis(op.created_at)),
+                                )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element()
+        };
 
         let app2 = app.clone();
         let organize_btn = Button::new("home-organize")
@@ -952,11 +1091,21 @@ impl AppRoot {
             .icon(IconName::Settings2)
             .label("开始整理")
             .on_click(move |_ev, _w, cx| {
-                let s = app2.update(cx, |s, cx| {
+                app2.update(cx, |s, cx| {
                     s.page = Page::Organize;
                     cx.notify();
                 });
-                let _ = s;
+            });
+        let app3 = app.clone();
+        let library_btn = Button::new("home-library")
+            .outline()
+            .icon(IconName::FolderOpen)
+            .label("选择目录")
+            .on_click(move |_ev, _w, cx| {
+                app3.update(cx, |s, cx| {
+                    s.page = Page::Library;
+                    cx.notify();
+                });
             });
 
         div()
@@ -970,14 +1119,47 @@ impl AppRoot {
                     .items_center()
                     .mb(px(16.))
                     .child(page_title("📊 相册概览", subtitle_for_home(state)))
-                    .child(organize_btn),
+                    .child(
+                        div()
+                            .flex().flex_row()
+                            .gap(px(8.))
+                            .child(library_btn)
+                            .child(organize_btn),
+                    ),
             )
+            .child(banner)
             .child(
                 div()
                     .id("home-stats")
                     .flex().flex_row()
                     .gap(px(14.))
                     .children(stat_cards.collect::<Vec<_>>()),
+            )
+            .child(
+                div()
+                    .id("home-progress-card")
+                    .bg(col(BG_WHITE))
+                    .rounded_lg()
+                    .px(px(20.))
+                    .py(px(16.))
+                    .shadow_sm()
+                    .mt(px(18.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(col(TEXT_SECONDARY))
+                            .mb(px(6.))
+                            .child("🧭 整理进度"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(col(TEXT_LIGHT))
+                            .mb(px(10.))
+                            .child(progress_text),
+                    )
+                    .child(progress_row),
             )
             .child(
                 div()
@@ -998,14 +1180,7 @@ impl AppRoot {
                             .mb(px(10.))
                             .child("📋 最近整理记录"),
                     )
-                    .child(
-                        div()
-                            .id("records-grid")
-                            .grid()
-                            .grid_cols(2)
-                            .gap(px(8.))
-                            .children(record_rows.collect::<Vec<_>>()),
-                    ),
+                    .child(records_body),
             )
     }
 
@@ -2105,6 +2280,213 @@ impl AppRoot {
             )
     }
 
+    // ===== 设置与隐私中心（M5） =====
+    fn page_settings(&self, state: &AppState) -> impl IntoElement + 'static {
+        let app = &self.app;
+        let paths = state.paths.clone();
+        let card = |title: &'static str, children: Vec<AnyElement>| -> AnyElement {
+            div()
+                .bg(col(BG_WHITE))
+                .rounded_lg()
+                .px(px(20.))
+                .py(px(16.))
+                .shadow_sm()
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(col(PRIMARY))
+                        .mb(px(10.))
+                        .child(title.to_owned()),
+                )
+                .children(children)
+                .into_any_element()
+        };
+
+        // 错误态横幅：索引库或后台任务失败时给出可读提示
+        let banner: AnyElement = if let Some(err) =
+            state.load_error.as_ref().or(state.last_error.as_ref())
+        {
+            div()
+                .id("settings-banner")
+                .px(px(14.))
+                .py(px(10.))
+                .rounded_md()
+                .bg(rgba(0xE0, 0x54, 0x4C, 0.10))
+                .text_size(px(12.))
+                .text_color(col(DANGER))
+                .child(format!("⚠ {err}"))
+                .into_any_element()
+        } else {
+            div().id("settings-banner-none").into_any_element()
+        };
+
+        // 1) 本机数据路径（全部来自 Paths，非硬编码）
+        let paths_for_btn = paths.clone();
+        let open_dir_btn = Button::new("settings-open-dir")
+            .outline()
+            .icon(IconName::FolderOpen)
+            .label("打开数据目录")
+            .on_click(move |_ev, _w, _cx| {
+                reveal_in_explorer(&paths_for_btn.data_dir);
+            });
+        let path_rows: Vec<(&'static str, String)> = vec![
+            ("数据目录", paths.data_dir.display().to_string()),
+            ("索引库", paths.db_path.display().to_string()),
+            ("缩略图缓存", paths.cache_dir.display().to_string()),
+            ("回收站", paths.trash_dir.display().to_string()),
+            ("日志文件", paths.log_path.display().to_string()),
+        ];
+        let path_children: Vec<AnyElement> = path_rows
+            .into_iter()
+            .map(|(label, value)| info_block(label, value))
+            .chain(std::iter::once(
+                div().mt(px(6.)).child(open_dir_btn).into_any_element(),
+            ))
+            .collect();
+        let path_card = card("💾 本机数据", path_children);
+
+        // 2) 整理偏好：回收站保留期（持久化到 settings，回收站页清理按钮跟随）
+        let retention = state.retention_days;
+        let app_ret = app.clone();
+        let retention_buttons = [7_i64, 30_i64, 90_i64]
+            .into_iter()
+            .enumerate()
+            .map(|(i, days)| {
+                let app = app_ret.clone();
+                Button::new(("settings-retention", i))
+                    .when(days == retention, |b| b.primary())
+                    .when(days != retention, |b| b.outline())
+                    .label(format!("{} 天", days))
+                    .on_click(move |_ev, _w, cx| {
+                        app.update(cx, |s, cx| {
+                            let result = crate::core::db::open(&s.paths.db_path)
+                                .map_err(anyhow::Error::from)
+                                .and_then(|conn| ops_trash::set_retention_days(&conn, days));
+                            match result {
+                                Ok(()) => {
+                                    s.retention_days = days;
+                                    s.ops_status = format!("回收站保留期已设为 {} 天", days);
+                                    s.last_error = None;
+                                }
+                                Err(e) => {
+                                    s.ops_status = format!("保存设置失败：{e}");
+                                    s.last_error = Some(format!("保存设置失败：{e}"));
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let retention_children: Vec<AnyElement> = vec![
+            div()
+                .flex().flex_row()
+                .items_center()
+                .gap(px(10.))
+                .children(retention_buttons)
+                .into_any_element(),
+            div()
+                .mt(px(8.))
+                .text_size(px(11.))
+                .text_color(col(TEXT_LIGHT))
+                .child(format!(
+                    "当前保留 {} 天；回收站页「清理 N 天前」按钮与说明会跟随此设置，配置保存在本机索引库中。",
+                    retention
+                ))
+                .into_any_element(),
+        ];
+        let retention_card = card("🗂 整理偏好", retention_children);
+
+        // 3) 数据概况：全部来自真实索引与操作日志
+        let overview_rows: Vec<(&'static str, String)> = vec![
+            ("已索引照片", format!("{} 张", state.data.total_count)),
+            ("占用空间", human_size(state.data.total_bytes)),
+            ("扫描目录", format!("{} 个", state.data.root_count)),
+            (
+                "回收站",
+                format!("{} 张 · {}", state.ops_data.trash_count, state.ops_data.size_label()),
+            ),
+            ("操作记录", format!("{} 条", state.ops_data.recent_ops.len())),
+            ("已分析照片", format!("{} 张", state.analyze_data.analyzed_count)),
+        ];
+        let overview_children: Vec<AnyElement> = overview_rows
+            .into_iter()
+            .map(|(label, value)| info_row(label, value))
+            .collect();
+        let overview_card = card("📊 数据概况", overview_children);
+
+        // 4) 隐私说明
+        let privacy_lines = [
+            "全部索引、缩略图、操作日志与回收站文件都保存在上方「数据目录」，不上传任何照片或元数据。",
+            "不需要账号、不联网、不含遥测；断网状态下扫描、分析、整理、归档、撤销全部可用。",
+            "删除一律先把文件移动到回收站，可恢复或一次撤销；只有「清空回收站 / 清理过期项」才会永久删除。",
+            "归档默认目标为扫描根目录的同级目录，避免归档副本被下次扫描重复索引。",
+        ];
+        let privacy_children: Vec<AnyElement> = privacy_lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                div()
+                    .id(("settings-privacy", i))
+                    .flex().flex_row()
+                    .gap(px(8.))
+                    .py(px(5.))
+                    .text_size(px(12.))
+                    .text_color(col(TEXT_SECONDARY))
+                    .child(Icon::new(IconName::CircleCheck).size_3().text_color(col(GOLD)))
+                    .child(line.to_owned())
+                    .into_any_element()
+            })
+            .collect();
+        let privacy_card = card("🔒 隐私", privacy_children);
+
+        // 5) 关于
+        let about_rows: Vec<(&'static str, &'static str)> = vec![
+            ("应用", "Akashic · 相册整理师 v0.1.0"),
+            ("构建", "Rust edition 2024 · gpui 0.2.2 / gpui-component 0.5.1"),
+            ("索引", "SQLite（rusqlite bundled，WAL）"),
+            ("文档", "CODEBUDDY.md → .docs/WORKFLOW.md → .docs/INDEX.md / DEV_PLAN.md"),
+        ];
+        let about_children: Vec<AnyElement> = about_rows
+            .into_iter()
+            .map(|(label, value)| info_row(label, value.to_owned()))
+            .collect();
+        let about_card = card("ℹ 关于", about_children);
+
+        let app_home = app.clone();
+        let home_btn = Button::new("settings-home")
+            .ghost()
+            .icon(IconName::LayoutDashboard)
+            .label("返回首页")
+            .on_click(move |_ev, _w, cx| {
+                app_home.update(cx, |s, cx| {
+                    s.page = Page::Home;
+                    cx.notify();
+                });
+            });
+
+        div()
+            .id("page-settings")
+            .flex().flex_col()
+            .gap(px(14.))
+            .child(
+                div()
+                    .flex().flex_row()
+                    .justify_between()
+                    .items_center()
+                    .child(page_title("⚙ 设置与隐私", "全部数据仅存本机 · 离线可用"))
+                    .child(home_btn),
+            )
+            .child(banner)
+            .child(path_card)
+            .child(retention_card)
+            .child(overview_card)
+            .child(privacy_card)
+            .child(about_card)
+    }
+
     // ===== 回收站页（M3） =====
     fn page_trash(&self, state: &AppState) -> impl IntoElement + 'static {
         let app = &self.app;
@@ -2185,15 +2567,16 @@ impl AppRoot {
                 });
             });
         let app_purge = app.clone();
-        let purge_btn = Button::new("trash-purge").ghost().icon(IconName::Redo).label("清理 30 天前")
+        let purge_btn = Button::new("trash-purge").ghost().icon(IconName::Redo).label(format!("清理 {} 天前", state.retention_days))
             .on_click(move |_ev, _w, cx| {
                 app_purge.update(cx, |s, cx| {
                     let paths = s.paths.clone();
+                    let days = s.retention_days;
                     let result = crate::core::db::open(&paths.db_path)
                         .map_err(anyhow::Error::from)
-                        .and_then(|conn| ops_trash::purge_expired(&conn, 30));
+                        .and_then(|conn| ops_trash::purge_expired(&conn, days));
                     match result {
-                        Ok(n) => s.ops_status = format!("已清理 {} 天前项目 {} 张", 30, n),
+                        Ok(n) => s.ops_status = format!("已清理 {} 天前项目 {} 张", days, n),
                         Err(e) => s.ops_status = format!("清理失败：{e}"),
                     }
                     s.reload_all();
@@ -2205,7 +2588,7 @@ impl AppRoot {
             .on_click(move |_ev, _w, cx| app_undo.update(cx, |s, _cx| s.undo_trash()));
 
         let status = if state.ops_status.is_empty() {
-            format!("回收站中的文件保留 30 天，之后可手动清理；恢复会放回原路径。当前 {} 张 · {}", ops.trash_count, ops.size_label())
+            format!("回收站中的文件保留 {} 天，之后可手动清理；恢复会放回原路径。当前 {} 张 · {}", state.retention_days, ops.trash_count, ops.size_label())
         } else {
             state.ops_status.clone()
         };
@@ -2268,8 +2651,17 @@ fn stable_hue(s: &str) -> f32 {
     (h % 360) as f32
 }
 
-/// 首页副标题。
+/// 首页副标题：错误态 / 加载态 / 正常态均来自真实状态。
 fn subtitle_for_home(state: &AppState) -> String {
+    if let Some(err) = state.load_error.as_ref().or(state.last_error.as_ref()) {
+        return format!("索引或后台任务异常 · {err}");
+    }
+    if state.is_scanning {
+        return format!("正在扫描 · {}", state.scan_status);
+    }
+    if state.is_analyzing {
+        return format!("正在分析 · {}", state.analyze_status);
+    }
     if !state.data.loaded {
         "尚未建立索引 · 前往相册库开始".to_string()
     } else {
@@ -2493,6 +2885,26 @@ fn photo_thumb(photo: &Photo) -> AnyElement {
 }
 
 /// 毫秒时间戳 → 可读日期（UTC）。
+/// 人类可读的字节数（首页统计 / 设置页数据概况共用）。
+fn human_size(bytes: i64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KB", bytes / 1024)
+    }
+}
+
+/// 按字符数截断长文本，超出时追加省略号。
+fn truncate(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
 fn format_millis(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())

@@ -11,21 +11,22 @@
 > 更新日期：2026-11-18 16:05 +0800（M3 批量操作与回收站：新增 core-ops 模块 md 与 ui/ops.rs、tests/ops_test.rs；相册库批量删除/重命名、重命名页与回收站页）。
 > 更新日期：2026-11-18 16:35 +0800（修复缩略图不显示：所有照片展示位接入 gpui `img(PathBuf)` 真实缩略图，详情弹窗升级为原图大图 + 完整图像信息；刷新 ui-desktop hash）。
 > 更新日期：2026-11-18 16:58 +0800（M4 智能归档：新增 core/ops/archive.rs 与归档页，4 种规则 / 移动·复制 / 完整目录树预览 / 撤销；整理页卡片与侧栏徽标改真实；刷新 4 个模块 hash）。
+> 更新日期：2026-11-18 17:40 +0800（M5 首页与体验闭环：首页真实最近操作/整理进度/加载·空·错误态、设置与隐私页、可配置回收站保留期、窗口自适应与最小尺寸、图标 47/47 全登记、清理 M0 模拟数据、readme 重写；刷新 5 个模块 hash 与状态总览）。
 
 ## 项目概述
-Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引（目录选择/后台扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索）。M2 已实现分析与智能整理：模糊评分、截图启发式、大文件排序、相似归组（pHash + dssim + 并查集），扫描后自动后台分析，整理页 4 个工具卡片接入真实结果列表。M3 已实现批量操作与回收站：批量删除（移动到回收站，绝不永久丢失）、批量重命名（预设模板+预览+冲突处理+一次撤销）、回收站恢复/清空/30 天清理，操作日志贯穿。所有照片展示位（相册库网格/整理结果/相似组/回收站）已接入 gpui `img(PathBuf)` 真实缩略图，点击照片弹出原图大图 + 完整图像信息（基本信息/分析结果/索引字段）。M4 已实现智能归档：按年/年月/故事/标签 4 种规则生成完整目录树预览，支持移动与复制两种模式，执行后可一次撤销；整理页「智能重命名/智能归档」卡片与侧栏「智能整理」徽标均已接真实数据。地图足迹仍属本期暂缓。
+Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引（目录选择/后台扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索）。M2 已实现分析与智能整理：模糊评分、截图启发式、大文件排序、相似归组（pHash + dssim + 并查集），扫描后自动后台分析，整理页 4 个工具卡片接入真实结果列表。M3 已实现批量操作与回收站：批量删除（移动到回收站，绝不永久丢失）、批量重命名（预设模板+预览+冲突处理+一次撤销）、回收站恢复/清空/可配置保留期清理，操作日志贯穿。所有照片展示位（相册库网格/整理结果/相似组/回收站）已接入 gpui `img(PathBuf)` 真实缩略图，点击照片弹出原图大图 + 完整图像信息（基本信息/分析结果/索引字段）。M4 已实现智能归档：按年/年月/故事/标签 4 种规则生成完整目录树预览，支持移动与复制两种模式，执行后可一次撤销；整理页「智能重命名/智能归档」卡片与侧栏「智能整理」徽标均已接真实数据。M5 完成体验闭环：首页统计/整理进度/最近操作全部接真实数据并补加载·空·错误态，新增设置与隐私中心（本机路径、可配置回收站保留期、数据概况、隐私说明、关于），窗口去掉 1200×780 强绑定并设最小尺寸，图标注册补齐 47/47，清理 M0 模拟数据，readme.md 重写为可独立上手的文档。地图足迹仍属本期暂缓。
 
 ## 目录职责表
 
 | 目录 / 文件 | 职责 | 对应模块 md |
 | --- | --- | --- |
-| `src/main.rs` | 组合根：Application/Assets/GPUI 初始化、本地目录初始化、打开窗口 | [ui-desktop](modules/ui-desktop.md) |
+| `src/main.rs` | 组合根：Application/Assets/GPUI 初始化、本地目录初始化、窗口初始尺寸与 `window_min_size` | [ui-desktop](modules/ui-desktop.md) |
 | `src/lib.rs` | 库入口：`pub mod core; pub mod ui;` | [build-config](modules/build-config.md) |
 | `src/core/model.rs` / `config.rs` | 真实数据模型（Photo/Folder/ScanStats）与本地路径配置 | [core-model](modules/core-model.md) |
 | `src/core/db.rs` / `scanner.rs` / `thumbnail.rs` | SQLite 索引、递归扫描+EXIF+哈希、缩略图缓存、分析结果/操作日志/settings 读写 | [core-scanner](modules/core-scanner.md) |
 | `src/core/analyze/*.rs` | 模糊评分、截图识别、大文件排序、相似归组（pHash+dssim+并查集） | [core-analyze](modules/core-analyze.md) |
-| `src/core/ops/*.rs` | 回收站（删除/恢复/清空/30 天清理/撤销）、批量重命名模板引擎、M4 智能归档（4 规则 / 移动·复制 / 目录树预览 / 执行 / 撤销）、操作日志 | [core-ops](modules/core-ops.md) |
-| `src/ui/app.rs` / `assets.rs` | gpui 渲染：全局状态、页面分发（6 页含智能归档）、目录树、照片图片渲染（缩略图/原图大图）、详情弹窗、整理页结果列表、重命名页、归档页（目录树预览）、回收站页、图标资源 | [ui-desktop](modules/ui-desktop.md) |
+| `src/core/ops/*.rs` | 回收站（删除/恢复/清空/保留期清理/撤销）、批量重命名模板引擎、M4 智能归档（4 规则 / 移动·复制 / 目录树预览 / 执行 / 撤销）、操作日志 | [core-ops](modules/core-ops.md) |
+| `src/ui/app.rs` / `assets.rs` | gpui 渲染：全局状态、页面分发（7 页含智能归档/设置与隐私）、目录树、照片图片渲染（缩略图/原图大图）、详情弹窗、整理页结果列表、重命名页、归档页（目录树预览）、回收站页、首页真实统计与状态态、图标资源（47 个 SVG 全登记） | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/library.rs` | UI 数据适配层：索引数据 → 相册库视图模型 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/analyze.rs` | UI 分析适配层：分析结果 → 整理页视图模型 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/ops.rs` | UI 批量操作适配层：回收站/操作日志 → 回收站页视图模型 | [ui-desktop](modules/ui-desktop.md) |
@@ -33,11 +34,12 @@ Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私�
 | `tests/analyze_test.rs` | 分析链路集成测试（清晰/模糊/重复/截图样本） | [core-analyze](modules/core-analyze.md) |
 | `tests/ops_test.rs` | 批量操作集成测试（重命名100张+撤销、删除恢复、冲突、清空、30天清理） | [core-ops](modules/core-ops.md) |
 | `tests/archive_test.rs` | M4 归档集成测试（目录树与落盘一致、复制保留源文件、撤销恢复原路径、冲突不覆盖、4 规则与缺失元数据兜底、预览只读/settings） | [core-ops](modules/core-ops.md) |
+| `tests/settings_test.rs` | M5 设置项集成测试（保留期默认值/往返/脏值回退/越界拒绝） | [core-ops](modules/core-ops.md) |
 | `vendor/imageflow/` | imageflow git submodule（固定 commit `7cbe26be`），图像编解码 | [build-config](modules/build-config.md) |
 | `.gitmodules` | submodule 配置：vendor/imageflow → GitHub 地址 | [build-config](modules/build-config.md) |
 | `akashic-ds.html` | 单文件 HTML 交互设计稿，5 个页面 + 照片详情弹窗 | [design-prototype](modules/design-prototype.md) |
 | `design.md` | 产品需求文档（定位、MVP 功能、信息架构、视觉基调、交付物状态） | [product-spec](modules/product-spec.md) |
-| `readme.md` | 项目名与空版本说明，待补充 | [product-spec](modules/product-spec.md) |
+| `readme.md` | M5 重写的上手文档：环境要求、submodule、构建/运行/测试、首次使用、数据目录、文档导航、已知限制 | [product-spec](modules/product-spec.md) |
 | `Cargo.toml` / `Cargo.lock` | 包定义、依赖与版本锁定 | [build-config](modules/build-config.md) |
 | `assets/icons/*.svg` | 47 个 Lucide 线性图标，编译期嵌入 | [icon-assets](modules/icon-assets.md) |
 | `.docs/WORKFLOW.md` | AI 工作协议（Agent 不得修改） | [ai-workflow](modules/ai-workflow.md) |
@@ -86,32 +88,34 @@ ai-workflow ──> 约束所有 Agent 对以上模块的读取与文档更新
 - 产品规则：`CODEBUDDY.md` / `Claude.md` → `.docs/WORKFLOW.md`（每次任务先读）。
 - 文档导航：`.docs/INDEX.md`（本文件）→ `.docs/modules/<模块>.md`。
 - 程序入口：`src/main.rs::main()` → `Paths::platform_default/ensure_dirs` → `ui::app::new_app_state`（加载索引）→ `AppRoot::new` → `Root::new`。
-- 页面分发：`src/ui/app.rs::AppRoot::render_page`（Page::Home / Organize / Library / Rename / Archive / Trash）。
+- 页面分发：`src/ui/app.rs::AppRoot::render_page`（Page::Home / Organize / Library / Rename / Archive / Trash / Settings）。
 - 扫描入口：`AppState::start_scan` → 后台 `core::scanner::scan_root` → `core::db` 写库 → channel 回传进度 → `LibraryData::reload`。
 - 分析入口：扫描完成后自动 `AppState::start_analysis`（或整理页「重新分析」）→ 后台 `core::analyze::analyze_library` → `core::db` 写回分析结果 → `AnalyzeProgress` 回传 → `AnalyzeData::reload`。
 - 批量删除入口：相册库「删除到回收站」→ `AppState::batch_trash` → `core::ops::trash::trash_photos`（移动到回收站+写库）→ `reload_all`；撤销 `undo_trash`。
 - 重命名入口：相册库「重命名」→ `Page::Rename`（预设模板+预览）→ `AppState::batch_rename` → `core::ops::rename::execute`；撤销 `undo_rename`。
-- 回收站入口：侧栏「回收站」→ `Page::Trash`（`OpsData`）→ 恢复 `restore_items` / 清空 `empty_trash` / 30 天清理 `purge_expired`。
+- 回收站入口：侧栏「回收站」→ `Page::Trash`（`OpsData`）→ 恢复 `restore_items` / 清空 `empty_trash` / 按设置保留期清理 `purge_expired`。
 - 归档入口：侧栏「智能归档」或整理页「智能归档」卡片 → `Page::Archive` → `AppState::refresh_archive_plan` → `core::ops::archive::plan`（只读目录树预览）→ `execute_archive` → `core::ops::archive::execute`（Move/Copy）→ 写 `ArchiveMove`/`ArchiveCopy` 日志；撤销 `undo_archive` → `archive::undo`。规则/模式/目标目录持久化在 `settings`（`archive.rule/mode/dest`）。
 - 图片渲染入口：`src/ui/app.rs::photo_thumb(&Photo)` → `thumbnail_source`（缩略图缓存优先）→ `gpui::img(PathBuf)`（`Resource::Path` → `fs::read` + `image` 解码，不经过 `Assets`）→ `ObjectFit::Cover` + fallback/loading 色块降级。详情大图走 `preview_source`（原图优先）+ `ObjectFit::Contain`。
 - 图片详情入口：普通点击照片 → `open_photo_dialog(photo: Photo, window, cx)` → 原图大图 + 基本信息/分析结果/索引分区 + 「打开原图」/「所在文件夹」。
-- 真实数据：`src/core/db.rs`（Repository）、`src/core/scanner.rs`（扫描）、`src/ui/library.rs`（视图适配）；模型在 `core/model.rs`，路径在 `core/config.rs`。
+- 首页入口：`Page::Home` → `page_home`：统计卡来自 `LibraryData`，整理进度来自 `AnalyzeData`/`analyze_status`，最近整理记录来自 `OpsData.recent_ops`（`OpKind::label()`）；加载/错误态由 `is_scanning/is_analyzing/load_error/last_error` 驱动。
+- 设置与隐私入口：侧栏「设置」→ `Page::Settings` → `page_settings`：本机 `Paths` 路径、保留期按钮 `ops_trash::set_retention_days`、真实数据概况、隐私说明；回收站页「清理 N 天前」跟随 `retention_days`。
+- 窗口尺寸：`src/main.rs` 的 `WindowOptions.window_min_size = 960×640`，`AppRoot::render` 的 `windowcard` 用 `.size_full()` 跟随窗口。
 - 分析算法：`src/core/analyze/`（blur / classify / similarity / pipeline）；测试 `tests/analyze_test.rs`。
 - 批量操作：`src/core/ops/`（trash / rename / archive / mod）；测试 `tests/ops_test.rs` / `tests/archive_test.rs`。
 - 设计稿入口：`akashic-ds.html` 的 `#page-library`（默认 active）与 `switchPage(pageId)`。
-- 构建验证：`cargo check --manifest-path D:/Code/Freespace/akashic/Cargo.toml`（2026-11-16 通过，exit 0）。
+- 构建验证：`cargo check` / `cargo test` / `cargo build`（M5 全量通过：41 个测试全绿、debug 产物 54MB）。
 
 ## 文档状态总览
 
 | 模块 | 覆盖 hash | 状态 | 可信度 |
 | --- | --- | --- | --- |
-| ui-desktop | 886ec4bf6346 | valid | AI 生成未审 |
-| core-model | 5e578d6049ef | valid | AI 生成未审 |
+| ui-desktop | a3bfa6e06430 | valid | AI 生成未审 |
+| core-model | ac090fe9eac2 | valid | AI 生成未审 |
 | core-scanner | fec45f251fa6 | valid | AI 生成未审 |
 | core-analyze | f49408cd46d5 | valid | AI 生成未审 |
-| core-ops | afa9b83033fb | valid | AI 生成未审 |
+| core-ops | c46895ffcc9d | valid | AI 生成未审 |
 | design-prototype | d32b2f6af661 | valid | AI 生成未审 |
-| product-spec | 2df241d5d3bf | valid | AI 生成未审 |
+| product-spec | 1ab983a7357a | valid | AI 生成未审 |
 | build-config | 532872a43d8b | valid | AI 生成未审 |
 | icon-assets | 4f60f3a7bd02 | valid | AI 生成未审 |
 | ai-workflow | 3dfb897e056b | valid | AI 生成未审 |

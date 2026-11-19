@@ -21,11 +21,14 @@ fn main() {
     app.run(move |cx| {
         gpui_component::init(cx);
         cx.spawn(async move |cx| {
+            // 1200×780 仅作为首次打开时的初始尺寸，不再与 UI 布局强绑定；
+            // 窗口可自由缩放，最小尺寸保证侧栏 + 内容区不挤压。
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: Point::new(px(80.), px(40.)),
                     size: Size::new(px(1200.), px(780.)),
                 })),
+                window_min_size: Some(Size::new(px(960.), px(640.))),
                 ..WindowOptions::default()
             };
             let paths_for_window = paths.clone();
