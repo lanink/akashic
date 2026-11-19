@@ -12,9 +12,10 @@
 > 更新日期：2026-11-18 16:35 +0800（修复缩略图不显示：所有照片展示位接入 gpui `img(PathBuf)` 真实缩略图，详情弹窗升级为原图大图 + 完整图像信息；刷新 ui-desktop hash）。
 > 更新日期：2026-11-18 16:58 +0800（M4 智能归档：新增 core/ops/archive.rs 与归档页，4 种规则 / 移动·复制 / 完整目录树预览 / 撤销；整理页卡片与侧栏徽标改真实；刷新 4 个模块 hash）。
 > 更新日期：2026-11-18 17:40 +0800（M5 首页与体验闭环：首页真实最近操作/整理进度/加载·空·错误态、设置与隐私页、可配置回收站保留期、窗口自适应与最小尺寸、图标 47/47 全登记、清理 M0 模拟数据、readme 重写；刷新 5 个模块 hash 与状态总览）。
+> 更新日期：2026-11-19 08:55 +0800（M6 打磨与交付：相册库 uniform_list 虚拟滚动、5000 张性能基准、[profile.release]、便携版打包脚本与产物、design.md 状态刷新、CHANGELOG 与 readme 发布章节；全量刷新模块 hash 与状态总览）。
 
 ## 项目概述
-Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引（目录选择/后台扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索）。M2 已实现分析与智能整理：模糊评分、截图启发式、大文件排序、相似归组（pHash + dssim + 并查集），扫描后自动后台分析，整理页 4 个工具卡片接入真实结果列表。M3 已实现批量操作与回收站：批量删除（移动到回收站，绝不永久丢失）、批量重命名（预设模板+预览+冲突处理+一次撤销）、回收站恢复/清空/可配置保留期清理，操作日志贯穿。所有照片展示位（相册库网格/整理结果/相似组/回收站）已接入 gpui `img(PathBuf)` 真实缩略图，点击照片弹出原图大图 + 完整图像信息（基本信息/分析结果/索引字段）。M4 已实现智能归档：按年/年月/故事/标签 4 种规则生成完整目录树预览，支持移动与复制两种模式，执行后可一次撤销；整理页「智能重命名/智能归档」卡片与侧栏「智能整理」徽标均已接真实数据。M5 完成体验闭环：首页统计/整理进度/最近操作全部接真实数据并补加载·空·错误态，新增设置与隐私中心（本机路径、可配置回收站保留期、数据概况、隐私说明、关于），窗口去掉 1200×780 强绑定并设最小尺寸，图标注册补齐 47/47，清理 M0 模拟数据，readme.md 重写为可独立上手的文档。地图足迹仍属本期暂缓。
+Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引（目录选择/后台扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索）。M2 已实现分析与智能整理：模糊评分、截图启发式、大文件排序、相似归组（pHash + dssim + 并查集），扫描后自动后台分析，整理页 4 个工具卡片接入真实结果列表。M3 已实现批量操作与回收站：批量删除（移动到回收站，绝不永久丢失）、批量重命名（预设模板+预览+冲突处理+一次撤销）、回收站恢复/清空/可配置保留期清理，操作日志贯穿。所有照片展示位（相册库网格/整理结果/相似组/回收站）已接入 gpui `img(PathBuf)` 真实缩略图，点击照片弹出原图大图 + 完整图像信息（基本信息/分析结果/索引字段）。M4 已实现智能归档：按年/年月/故事/标签 4 种规则生成完整目录树预览，支持移动与复制两种模式，执行后可一次撤销；整理页「智能重命名/智能归档」卡片与侧栏「智能整理」徽标均已接真实数据。M5 完成体验闭环：首页统计/整理进度/最近操作全部接真实数据并补加载·空·错误态，新增设置与隐私中心（本机路径、可配置回收站保留期、数据概况、隐私说明、关于），窗口去掉 1200×780 强绑定并设最小尺寸，图标注册补齐 47/47，清理 M0 模拟数据，readme.md 重写为可独立上手的文档。M6 完成打磨与交付：相册库改为 gpui `uniform_list` 虚拟滚动（每行 4 张、等高，只渲染视口内行），新增 5000 张照片性能基准与 `[profile.release]` 优化配置，提供 Windows 便携版打包脚本与 zip 产物，刷新 `design.md` 交付物状态与实现差异、新增 `CHANGELOG.md`、readme 补发布章节，并全量复核模块 hash。地图足迹仍属本期暂缓。
 
 ## 目录职责表
 
@@ -26,7 +27,7 @@ Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私�
 | `src/core/db.rs` / `scanner.rs` / `thumbnail.rs` | SQLite 索引、递归扫描+EXIF+哈希、缩略图缓存、分析结果/操作日志/settings 读写 | [core-scanner](modules/core-scanner.md) |
 | `src/core/analyze/*.rs` | 模糊评分、截图识别、大文件排序、相似归组（pHash+dssim+并查集） | [core-analyze](modules/core-analyze.md) |
 | `src/core/ops/*.rs` | 回收站（删除/恢复/清空/保留期清理/撤销）、批量重命名模板引擎、M4 智能归档（4 规则 / 移动·复制 / 目录树预览 / 执行 / 撤销）、操作日志 | [core-ops](modules/core-ops.md) |
-| `src/ui/app.rs` / `assets.rs` | gpui 渲染：全局状态、页面分发（7 页含智能归档/设置与隐私）、目录树、照片图片渲染（缩略图/原图大图）、详情弹窗、整理页结果列表、重命名页、归档页（目录树预览）、回收站页、首页真实统计与状态态、图标资源（47 个 SVG 全登记） | [ui-desktop](modules/ui-desktop.md) |
+| `src/ui/app.rs` / `assets.rs` | gpui 渲染：全局状态、页面分发（7 页含智能归档/设置与隐私）、目录树、M6 `uniform_list` 虚拟滚动网格、照片图片渲染（缩略图/原图大图）、详情弹窗、整理页结果列表、重命名页、归档页、回收站页、首页真实统计与状态态、图标资源（47 个 SVG 全登记） | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/library.rs` | UI 数据适配层：索引数据 → 相册库视图模型 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/analyze.rs` | UI 分析适配层：分析结果 → 整理页视图模型 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/ops.rs` | UI 批量操作适配层：回收站/操作日志 → 回收站页视图模型 | [ui-desktop](modules/ui-desktop.md) |
@@ -35,12 +36,17 @@ Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私�
 | `tests/ops_test.rs` | 批量操作集成测试（重命名100张+撤销、删除恢复、冲突、清空、30天清理） | [core-ops](modules/core-ops.md) |
 | `tests/archive_test.rs` | M4 归档集成测试（目录树与落盘一致、复制保留源文件、撤销恢复原路径、冲突不覆盖、4 规则与缺失元数据兜底、预览只读/settings） | [core-ops](modules/core-ops.md) |
 | `tests/settings_test.rs` | M5 设置项集成测试（保留期默认值/往返/脏值回退/越界拒绝） | [core-ops](modules/core-ops.md) |
+| `tests/perf_test.rs` | M6 性能基准（5000 张合成图：扫描/冷启动/筛选耗时，`#[ignore]`） | [core-scanner](modules/core-scanner.md) |
+| `scripts/package_portable.ps1` | M6 Windows 便携版打包脚本（release 构建 → zip，含许可说明） | [build-config](modules/build-config.md) |
+| `dist/` | M6 便携版打包产物（zip，已被 `.gitignore` 忽略，不入库） | 无 |
+| `CHANGELOG.md` | M6 新增：0.1.0 版本变更记录（M0–M6 新增/修复/已知限制） | [product-spec](modules/product-spec.md) |
+| `.gitignore` | 构建产物 `/target`、便携包 `/dist/`、`/.workbuddy/` 等忽略规则 | [build-config](modules/build-config.md) |
 | `vendor/imageflow/` | imageflow git submodule（固定 commit `7cbe26be`），图像编解码 | [build-config](modules/build-config.md) |
 | `.gitmodules` | submodule 配置：vendor/imageflow → GitHub 地址 | [build-config](modules/build-config.md) |
 | `akashic-ds.html` | 单文件 HTML 交互设计稿，5 个页面 + 照片详情弹窗 | [design-prototype](modules/design-prototype.md) |
-| `design.md` | 产品需求文档（定位、MVP 功能、信息架构、视觉基调、交付物状态） | [product-spec](modules/product-spec.md) |
-| `readme.md` | M5 重写的上手文档：环境要求、submodule、构建/运行/测试、首次使用、数据目录、文档导航、已知限制 | [product-spec](modules/product-spec.md) |
-| `Cargo.toml` / `Cargo.lock` | 包定义、依赖与版本锁定 | [build-config](modules/build-config.md) |
+| `design.md` | v1 PRD（定位、MVP 功能、信息架构、视觉基调）；M6 刷新头部状态、第 5 节交付物真实状态并新增第 8 节实现差异 | [product-spec](modules/product-spec.md) |
+| `readme.md` | M5 重写、M6 扩为 8 节：环境、submodule、构建/运行/测试、首次使用、数据目录、文档导航、发布与便携包、已知限制 | [product-spec](modules/product-spec.md) |
+| `Cargo.toml` / `Cargo.lock` | 包定义、依赖与版本锁定、M6 `[profile.release]` | [build-config](modules/build-config.md) |
 | `assets/icons/*.svg` | 47 个 Lucide 线性图标，编译期嵌入 | [icon-assets](modules/icon-assets.md) |
 | `.docs/WORKFLOW.md` | AI 工作协议（Agent 不得修改） | [ai-workflow](modules/ai-workflow.md) |
 | `.docs/DEV_PLAN.md` | 开发计划（规划文档，非派生缓存，不参与覆盖 hash） | 无 |
@@ -103,20 +109,23 @@ ai-workflow ──> 约束所有 Agent 对以上模块的读取与文档更新
 - 分析算法：`src/core/analyze/`（blur / classify / similarity / pipeline）；测试 `tests/analyze_test.rs`。
 - 批量操作：`src/core/ops/`（trash / rename / archive / mod）；测试 `tests/ops_test.rs` / `tests/archive_test.rs`。
 - 设计稿入口：`akashic-ds.html` 的 `#page-library`（默认 active）与 `switchPage(pageId)`。
-- 构建验证：`cargo check` / `cargo test` / `cargo build`（M5 全量通过：41 个测试全绿、debug 产物 54MB）。
+- 虚拟滚动入口：`src/ui/app.rs::page_library` → `gpui::uniform_list("photo-virtual-grid", row_count, f)`，按 `GRID_COLUMNS=4` / `GRID_ROW_HEIGHT=162px` 等高 lazy 渲染。
+- 性能基准入口：`cargo test --release --test perf_test -- --ignored --nocapture`（`tests/perf_test.rs`，5000 张合成图）。
+- 便携包入口：`scripts/package_portable.ps1` → `dist/akashic-0.1.0-win-x86_64.zip`（`cargo build --release` + 文档 + 许可说明）。
+- 构建验证：`cargo check` / `cargo test` / `cargo build`（M6 全量通过：41 个测试全绿 + 1 个 ignore 基准、debug 产物 54MB、release 便携包）。
 
 ## 文档状态总览
 
 | 模块 | 覆盖 hash | 状态 | 可信度 |
 | --- | --- | --- | --- |
-| ui-desktop | a3bfa6e06430 | valid | AI 生成未审 |
+| ui-desktop | cce1cd37a7c9 | valid | AI 生成未审 |
 | core-model | ac090fe9eac2 | valid | AI 生成未审 |
-| core-scanner | fec45f251fa6 | valid | AI 生成未审 |
+| core-scanner | d76e8c5c0509 | valid | AI 生成未审 |
 | core-analyze | f49408cd46d5 | valid | AI 生成未审 |
 | core-ops | c46895ffcc9d | valid | AI 生成未审 |
 | design-prototype | d32b2f6af661 | valid | AI 生成未审 |
-| product-spec | 1ab983a7357a | valid | AI 生成未审 |
-| build-config | 532872a43d8b | valid | AI 生成未审 |
+| product-spec | 624f6ac441e3 | valid | AI 生成未审 |
+| build-config | 44dcb0c47faf | valid | AI 生成未审 |
 | icon-assets | 4f60f3a7bd02 | valid | AI 生成未审 |
 | ai-workflow | 3dfb897e056b | valid | AI 生成未审 |
 

@@ -9,6 +9,7 @@
 > 更新时间：2026-11-18 16:35 +0800（补充修复：所有照片展示位接入 gpui `img(PathBuf)` 真实缩略图，详情弹窗升级为原图大图 + 完整图像信息；提前完成 M1/M2/M3 遗留的「待 M5 接 `img()`」项）
 > 更新时间：2026-11-18 16:58 +0800（M4 完成：4 种归档规则 / 移动·复制 / 完整目录树预览 / 撤销，新增归档页与 core-ops 归档引擎，整理页卡片与侧栏徽标接真实数据）  
 > 更新时间：2026-11-19 08:30 +0800（M5 完成：首页真实统计/进度/最近操作与加载·空·错误态、设置与隐私中心、可配置回收站保留期、窗口自适应与最小尺寸、图标 47/47 全登记、清理 M0 模拟数据、readme 重写；41 个测试通过）  
+> 更新时间：2026-11-19 09:15 +0800（M6 完成：相册库 uniform_list 虚拟滚动、5000 张性能基准、[profile.release]、便携版打包脚本与产物、design.md 状态与交付物清单刷新、CHANGELOG 与 readme 发布章节、全量 hash 复核）  
 > 文档性质：规划文档，非 `.docs/modules/` 下的派生缓存；不参与覆盖 hash 校验。  
 > 依据：`design.md`（PRD v1）与 2026-11-16 的源码现状（见 `.docs/INDEX.md`）。
 
@@ -186,11 +187,15 @@ OxiGeo 可行性结论：**可以做，但不是照片足迹的核心依赖**。
 
 > **实际交付（2026-11-19）**：**core**——`model.rs` 删除 M0 模拟数据（`PhotoDef`/`PHOTOS`/`FolderNode`/`folder_defs()`/`expandable_id`）并改模块头注释，`OpKind` 新增 `label()` 中文展示名与 roundtrip 单测；`trash.rs` 新增 `DEFAULT_RETENTION_DAYS=30`、`retention_days(conn)`（读 `settings.trash.retention_days`，非法/越界回退默认）、`set_retention_days(conn, days)`（1..=3650 校验），新增 `tests/settings_test.rs` 4 个用例（默认值/往返/脏值回退/越界拒绝）。**UI**——`AppState` 增 `load_error/last_error/retention_days`，扫描/分析失败写入 `last_error`、成功清空；新增 `Page::Settings` + 侧栏入口 + `page_settings`（本机 5 条 `Paths` 路径与打开数据目录、保留期 7/30/90 按钮即时写库、真实数据概况、隐私说明、关于）；`page_home` 重写为 4 张真实统计卡 + 整理进度（4 类分析数 + 后台状态）+ 最近 6 条操作日志（`OpKind::label()` + 时间 + 数量 + 详情）+ 加载/空/错误态横幅，`subtitle_for_home` 加状态；回收站「清理 N 天前」按钮与说明跟随 `retention_days`；新增 `human_size`/`truncate` helper。**窗口**——`main.rs` 设 `window_min_size = 960×640`，`windowcard` 由 `.w(1200.).h(780.)` 改 `.size_full()`，去掉硬编码强绑定。**图标**——`assets.rs` 从 22 个登记补齐到 47 个 SVG 全登记（校验 files=47 / registered=47 / missing=0 / extra=0）。**文档**——`readme.md` 由 4 行占位重写为可独立上手文档（环境/submodule/构建·运行·测试/首次使用/数据目录/文档导航/已知限制）；全仓扫描确认无 `1200|780|PHOTOS|folder_defs|M0 模拟|"12"` 残留。**验证**：`cargo check` 通过；`cargo test` 41 个全绿（22 单元 + 2 analyze + 6 archive + 5 ops + 4 settings + 2 scanner）；`cargo build` 成功（54MB）；10 个模块文档覆盖 hash 全量校验 valid。**偏差与遗留**：① 保留期提供 7/30/90 三个预设按钮（core 支持 1..=3650 任意值，但未做自由输入）；② 设置即时写库，无「保存/取消」二次确认；③ 错误横幅只在首页与设置页展示，其他页面仍依赖 `scan_status/ops_status` 文本；④ 窗口最小尺寸固定 960×640，未做 DPI/多显示器自适应；⑤ 未做 GUI 冒烟（无交互环境）；⑥ `design.md` 头部状态与交付物清单仍未刷新，留 M6。已同步 core-model/core-ops/ui-desktop/icon-assets/product-spec 模块 md 与 INDEX/DEV_PLAN。
 
-### M6 · 打磨与交付
+### M6 · 打磨与交付 — 已完成（2026-11-19）
 
 任务：性能剖析与虚拟滚动网格；便携版/安装包；更新 readme.md、design.md 状态与设计交付物清单；生成 CHANGELOG；全量刷新模块 md 的 hash 与 INDEX 状态总览。
 
 验收：5000 张照片场景下冷启动、扫描、筛选耗时可接受；文档 hash 校验全部为 valid。
+
+> **实际交付（2026-11-19）**：**虚拟滚动**——`src/ui/app.rs::page_library` 由 `.grid().grid_cols(4).children(全部 tiles)` 改为 gpui 0.2.2 `uniform_list("photo-virtual-grid", row_count, f)`，按 `GRID_COLUMNS=4` 张一行、`GRID_ROW_HEIGHT=162px`（150 tile + 12 留白）等高 lazy 渲染；闭包捕获 owned `Vec<Photo>`/`selected`/`Entity<AppState>`，按 `row * GRID_COLUMNS + column` 还原全局索引 `idx`，多选与点击详情口径与改造前一致；新增 3 个常量与 `use std::ops::Range`；5000 张只创建视口内约十余行元素。**性能基准**——新增 `tests/perf_test.rs`（`#[ignore]`）：临时目录生成 5000 张 16×16 合成 PNG，分 20 个子目录各 250 张，颜色随序号变化以保证内容哈希互不相同（避免缩略图缓存命中同一 key 导致失真）；测量 `scan_root` 扫描、`LibraryData::reload` 冷启动、`visible_photos()` ×100 筛选并 `--nocapture` 打印，`AKASHIC_BENCH_COUNT` 可缩小规模；不测 O(n²) 的相似分析。**发布配置**——`Cargo.toml` 新增 `[profile.release]`（`opt-level=3` / `lto="thin"` / `codegen-units=1` / `strip=true`），不设 `panic="abort"` 以保证 `cargo test --release` 可用。**便携包**——新增 `scripts/package_portable.ps1`（release 构建 → 收集 exe / readme / CHANGELOG → 写 `LICENSE-NOTICE.txt` → `Compress-Archive` 生成 `dist/akashic-0.1.0-win-x86_64.zip`），`.gitignore` 加 `/dist/`。**文档**——`design.md` 头部状态改为「MVP v1 已实现」、第 5 节交付物清单按源码标注「已实现 / 部分实现 / 未实现（暂缓）」并附实现位置、新增第 8 节 PRD 与实现差异；新增 `CHANGELOG.md`（0.1.0 汇总 M0–M6）；`readme.md` 扩为 8 节（发布与便携包、性能基准命令）；同步 INDEX 的目录职责/关键入口/状态总览，并刷新 4 个模块 md 的覆盖范围与覆盖 hash（build-config 纳入 `.gitignore` 与打包脚本、core-scanner 纳入 2 个测试、product-spec 纳入 CHANGELOG）。**验证**：`cargo check` / `cargo test` / `cargo build` 通过；10 个模块文档 hash 与 INDEX 状态总览全量校验 `ALL VALID`。**偏差与遗留**：① 仅提供 Windows 便携 zip，未制作 macOS / Linux 安装包或安装程序；② 未做 GUI 自动化冒烟（无交互环境）；③ 相似分组为 O(n²) 级别，超大库分析耗时未纳入基准（基准覆盖扫描/冷启动/筛选）；④ 虚拟网格固定 4 列、无响应式断点，窄窗口靠 `window_min_size` 与横向滚动；⑤ `[profile.release]` 的 thin LTO + 单 codegen unit 使首次 release 编译明显变慢；⑥ `design.md` 第 3/4 节保留为原始 PRD 规划，与实现差异统一由第 5/8 节说明。
+
+> **性能实测（release / 5000 张，2026-11-19）**：合成图准备 7.98s（不计入指标）；`scan_root` **77.13s（15.43 ms/张）**、`LibraryData::reload` 冷启动 **28.83ms**、`visible_photos()` ×100 共 **3.36ms（0.034 ms/次）**、5000 张全部落库。release 首次编译 12m53s（thin LTO + 单 codegen unit），基准用例总耗时 92.82s。debug 下 60 张冒烟约 136 ms/张，release 提速约 8.8×。**验收结论**：冷启动与筛选远低于交互阈值；扫描 5000 张约 77s 且已在后台线程执行、UI 不阻塞，符合「耗时可接受」；相似分析为 O(n²) 级别，未纳入本次基准（已在遗留中记录）。便携包产物 `dist/akashic-0.1.0-win-x86_64.zip` **8.3 MB**（内含 21 MB 的 `akashic.exe`，经 `strip` 后压缩；另含 readme / CHANGELOG / LICENSE-NOTICE）。
 
 ## 7. 测试与验收原则
 

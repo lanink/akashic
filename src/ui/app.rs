@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -32,6 +33,14 @@ const TEXT_SECONDARY: u32 = 0x5A6A7A;
 const TEXT_LIGHT: u32 = 0x8A9AAA;
 const BORDER_LIGHT: u32 = 0xE8E4DE;
 const DANGER: u32 = 0xE0544C;
+
+// ===== M6 虚拟网格 =====
+/// 相册库每行固定列数；uniform_list 以「行」为 item，只渲染视口内的行。
+const GRID_COLUMNS: usize = 4;
+/// 单张缩略图高度（px）。
+const GRID_TILE_HEIGHT: f32 = 150.;
+/// 行高 = 缩略图高度 + 行间留白，所有行必须等高，uniform_list 才会按首行测量值排布。
+const GRID_ROW_HEIGHT: f32 = GRID_TILE_HEIGHT + 12.;
 
 /// hex -> Hsla
 fn col(hex: u32) -> Hsla {
@@ -1538,59 +1547,21 @@ impl AppRoot {
             .shadow_sm()
             .child(render_folder_tree(state, app.clone()));
 
-        let visible = state.data.visible_photos();
-        let tiles = visible
-            .iter()
-            .enumerate()
-            .map(|(idx, photo)| {
-                let app = app.clone();
-                let is_selected = state.selected.contains(&idx);
-                let location = photo.location.clone().unwrap_or_default();
-                let dialog_photo = (*photo).clone();
-                Button::new(("photo", idx))
-                    .p(px(0.))
-                    .relative()
-                    .overflow_hidden()
-                    .h(px(150.))
-                    .w_full()
-                    .bg(photo_block_bg(stable_hue(&photo.path.to_string_lossy())))
-                    .border_2()
-                    .when(is_selected, |b| b.border_color(col(GOLD)))
-                    .when(!is_selected, |b| b.border_color(transparent_black()))
-                    .child(photo_thumb(photo))
-                    .child(
-                        div()
-                            .id(("photolabel", idx))
-                            .absolute()
-                            .bottom_0()
-                            .left_0()
-                            .right_0()
-                            .px(px(8.))
-                            .py(px(2.))
-                            .bg(rgba(26, 38, 52, 0.7))
-                            .text_color(gpui::white())
-                            .text_size(px(10.))
-                            .child(location),
-                    )
-                    .on_click(move |ev, window, cx| {
-                        if ev.modifiers().control || ev.modifiers().platform {
-                            app.update(cx, |s, cx| {
-                                if s.selected.contains(&idx) {
-                                    s.selected.remove(&idx);
-                                } else {
-                                    s.selected.insert(idx);
-                                }
-                                cx.notify();
-                            });
-                        } else {
-                            open_photo_dialog(dialog_photo.clone(), window, cx);
-                        }
-                    })
-            })
-            .collect::<Vec<_>>();
+        // M6 虚拟滚动：把可见照片按 GRID_COLUMNS 张一行交给 uniform_list，
+        // 只构造视口内的行，5000 张照片时不会一次性创建数千个 Button / img 元素。
+        let photos: Vec<Photo> = state
+            .data
+            .visible_photos()
+            .into_iter()
+            .cloned()
+            .collect();
+        let selected = state.selected.clone();
+        let app_for_list = app.clone();
+        let total_visible = photos.len();
+        let row_count = total_visible.div_ceil(GRID_COLUMNS);
 
         // 空态：未扫描时给出引导
-        let grid_body: AnyElement = if visible.is_empty() {
+        let grid_body: AnyElement = if photos.is_empty() {
             div()
                 .id("library-empty")
                 .flex_1()
@@ -1613,16 +1584,77 @@ impl AppRoot {
                 )
                 .into_any_element()
         } else {
+            let list = uniform_list(
+                "photo-virtual-grid",
+                row_count,
+                move |range: Range<usize>, _window: &mut Window, _cx: &mut App| -> Vec<AnyElement> {
+                    let mut rows: Vec<AnyElement> = Vec::with_capacity(range.end - range.start);
+                    for row in range {
+                        let mut row_el = div()
+                            .id(("photo-row", row))
+                            .flex().flex_row()
+                            .gap(px(12.))
+                            .h(px(GRID_ROW_HEIGHT))
+                            .pb(px(12.));
+                        for column in 0..GRID_COLUMNS {
+                            let idx = row * GRID_COLUMNS + column;
+                            let Some(photo) = photos.get(idx) else { break };
+                            let is_selected = selected.contains(&idx);
+                            let location = photo.location.clone().unwrap_or_default();
+                            let dialog_photo = photo.clone();
+                            let tile_app = app_for_list.clone();
+                            let tile = Button::new(("photo", idx))
+                                .p(px(0.))
+                                .relative()
+                                .overflow_hidden()
+                                .h(px(GRID_TILE_HEIGHT))
+                                .flex_1()
+                                .bg(photo_block_bg(stable_hue(&photo.path.to_string_lossy())))
+                                .border_2()
+                                .when(is_selected, |b| b.border_color(col(GOLD)))
+                                .when(!is_selected, |b| b.border_color(transparent_black()))
+                                .child(photo_thumb(photo))
+                                .child(
+                                    div()
+                                        .id(("photolabel", idx))
+                                        .absolute()
+                                        .bottom_0()
+                                        .left_0()
+                                        .right_0()
+                                        .px(px(8.))
+                                        .py(px(2.))
+                                        .bg(rgba(26, 38, 52, 0.7))
+                                        .text_color(gpui::white())
+                                        .text_size(px(10.))
+                                        .child(location),
+                                )
+                                .on_click(move |ev, window, cx| {
+                                    if ev.modifiers().control || ev.modifiers().platform {
+                                        tile_app.update(cx, |s, cx| {
+                                            if s.selected.contains(&idx) {
+                                                s.selected.remove(&idx);
+                                            } else {
+                                                s.selected.insert(idx);
+                                            }
+                                            cx.notify();
+                                        });
+                                    } else {
+                                        open_photo_dialog(dialog_photo.clone(), window, cx);
+                                    }
+                                });
+                            row_el = row_el.child(tile);
+                        }
+                        rows.push(row_el.into_any_element());
+                    }
+                    rows
+                },
+            );
             div()
                 .id("photo-grid-scroll")
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .grid()
-                .grid_cols(4)
-                .gap(px(12.))
-                .content_start()
-                .children(tiles)
+                .size_full()
+                .child(list)
                 .into_any_element()
         };
 
@@ -1653,7 +1685,7 @@ impl AppRoot {
                                     .id("grid-count")
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(col(PRIMARY))
-                                    .child(format!("{}", visible.len())),
+                                    .child(format!("{}", total_visible)),
                             )
                             .child(" 张照片"),
                     )

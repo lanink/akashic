@@ -1,6 +1,9 @@
 # Rust 构建产物
 /target
 
+# M6 便携版打包产物（二进制，不入库）
+/dist/
+
 # IDE / 本地工具目录
 /.idea/
 /.meituan-catpaw/

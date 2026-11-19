@@ -3,7 +3,7 @@
 本地优先的桌面照片整理工具：不修图、不社交、不上传，把杂乱的相册扫描进本机索引，
 再按相似 / 模糊 / 截图 / 大文件筛选，批量删除（可恢复）、重命名、归档（可撤销）。
 
-> 状态：M0–M5 已完成（工程地基 / 真实索引 / 分析整理 / 批量操作与回收站 / 智能归档 / 首页与体验闭环）。
+> 状态：M0–M6 已完成（工程地基 / 真实索引 / 分析整理 / 批量操作与回收站 / 智能归档 / 首页与体验闭环 / 打磨与交付）。
 > 全部功能离线可用，照片与元数据只保存在本机应用数据目录。
 
 ## 1. 环境要求
@@ -37,6 +37,7 @@ git submodule update --init --recursive
 cargo check                      # 类型检查
 cargo test                       # 全部单元 + 集成测试（仅使用临时目录，不碰真实相册）
 cargo build                      # 产物 target/debug/akashic.exe（Windows 约 54MB）
+cargo build --release            # 优化产物 target/release/akashic.exe（便携包用）
 cargo run                        # 启动窗口
 ```
 
@@ -47,6 +48,7 @@ cargo run                        # 启动窗口
 - `tests/ops_test.rs`：重命名 100 张 + 一次撤销、删除恢复、冲突、清空、30 天清理。
 - `tests/archive_test.rs`：归档目录树与落盘一致、复制保留源文件、撤销恢复原路径、4 种规则与兜底。
 - `tests/settings_test.rs`：回收站保留期设置的默认值、往返、脏值回退与越界校验。
+- `tests/perf_test.rs`（`#[ignore]`）：5000 张场景性能基准，见第 7 节。
 
 ## 4. 第一次使用
 
@@ -81,24 +83,50 @@ src/lib.rs             pub mod core; pub mod ui;
 src/core/              不依赖 gpui，可独立单测：model / db / scanner / thumbnail / analyze / ops
 src/ui/                gpui 渲染：app.rs（状态与页面）/ assets.rs / library.rs / analyze.rs / ops.rs
 tests/                 集成测试（临时目录）
+scripts/               M6 便携版打包脚本
 vendor/imageflow/       固定 commit 的 git submodule
 .docs/                 文档体系
 ```
 
 - 项目规则：`CODEBUDDY.md`（Claude Code 用户看 `Claude.md`）→ **每次任务先读 `.docs/WORKFLOW.md`**。
 - 文档导航：`.docs/INDEX.md`（目录职责 / 依赖图 / 关键入口 / 文档状态总览）→ `.docs/modules/*.md`。
-- 开发计划与里程碑交付记录：`.docs/DEV_PLAN.md`；PRD 见 `design.md`；交互设计稿见 `akashic-ds.html`。
+- 开发计划与里程碑交付记录：`.docs/DEV_PLAN.md`；PRD 见 `design.md`（第 8 节列出实现差异）；交互设计稿见 `akashic-ds.html`；版本记录见 `CHANGELOG.md`。
 - 源码是唯一真相，`.docs/modules/` 下的 md 是派生缓存；改动接口/结构后需按 WORKFLOW 刷新覆盖 hash。
 
 依赖方向必须是 `main.rs → ui → core → 外部设施`，`core` 不得引用 `gpui`。
 
-## 7. 已知限制
+## 7. 发布与便携包
+
+Windows 便携包由 PowerShell 脚本生成（release 编译 → 收集 exe / 文档 / 许可说明 → 打 zip）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package_portable.ps1
+```
+
+产物 `dist/akashic-0.1.0-win-x86_64.zip`，解压后直接运行 `akashic.exe`，无需安装、不改注册表、
+不写系统目录；数据仍放在 `%LOCALAPPDATA%\akashic`。`dist/` 已加入 `.gitignore`，二进制不入库。
+
+> 包内含 `LICENSE-NOTICE.txt`：imageflow 为 AGPLv3（固定 commit `7cbe26be`），仅个人本地使用；
+> 若未来分发需按 AGPLv3 合规或取得商业授权。macOS / Linux 目前提供源码构建，未制作安装包。
+
+性能基准（默认 `#[ignore]`，不拖慢日常测试）：
+
+```bash
+cargo test --release --test perf_test -- --ignored --nocapture
+```
+
+基准在临时目录生成 5000 张合成 PNG，测量 `scan_root` 扫描、`LibraryData::reload` 冷启动加载与
+`visible_photos()` 筛选耗时；实测数字记录在 `CHANGELOG.md` 与 `.docs/DEV_PLAN.md` 的 M6 章节。
+
+## 8. 已知限制
 
 - 本期不做 HEIC/HEIF、RAW 解码；不支持格式由缩略图缓存兜底显示。
 - 照片足迹 / 地图展示（OxiGeo、GCJ-02、腾讯地图 GL JS）为暂缓项，规划保留在 DEV_PLAN 的 M4+。
 - imageflow 目前用 `c-codecs`（需 NASM）；`zen-codecs` 纯 Rust 路径依赖 GitHub 上的 zenjpeg/zenwebp git main，
   切换配置已写在 `Cargo.toml` 注释与 DEV_PLAN 风险表中，网络可访问后再启用。
-- 批量删除 / 重命名 / 归档为同步执行（个人库规模够用）；5000 张以上的性能剖析与虚拟滚动属 M6。
+- 批量删除 / 重命名 / 归档为同步执行（个人库规模够用，量大可改后台线程）；相册库已用 `uniform_list` 虚拟滚动，5000 张场景基准见第 7 节。
+- 相似分组的 pHash 预筛 + dssim 精排为 O(n²) 级别，超大库的分析耗时未纳入 5000 张基准（扫描/加载/筛选已测）。
 - 「故事」归档规则按「年 / 年-月_地点或首标签」推导，不是人物或事件聚类。
 - 复制模式归档、回收站恢复产生的副本索引不继承分析结果，需要重新分析。
+- 未制作 macOS / Linux 安装包，也未做 GUI 自动化冒烟测试（无交互环境）。
 - imageflow 为 AGPLv3；本软件定位个人本地使用，若未来商业分发需重新评估授权。

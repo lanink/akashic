@@ -33,3 +33,12 @@ walkdir = "2.5.0"        # 递归扫描目录
 chrono = "0.4.45"        # 时间解析与格式化
 rfd = "0.15.4"           # 原生目录选择对话框
 twox-hash = "2.1.3"      # 快速内容哈希（缓存 key / 去重辅助）
+
+# ---- M6 发布构建 ----
+# 便携版/安装包使用 `cargo build --release`；thin LTO + 单 codegen unit 换取更小的二进制，
+# 代价是首次 release 编译较慢。strip 去掉调试符号；不设 panic=abort，保证 `cargo test --release` 可用。
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

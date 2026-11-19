@@ -1,13 +1,13 @@
 # 模块：core-scanner
 
-> 生成时间：2026-11-18 16:58 +0800
-> 覆盖范围：src/core/db.rs, src/core/scanner.rs, src/core/thumbnail.rs（按路径排序）
-> 覆盖 hash：fec45f251fa6（取前 12 位，由生成者用命令行工具计算）
+> 生成时间：2026-11-19 08:54 +0800
+> 覆盖范围：src/core/db.rs, src/core/scanner.rs, src/core/thumbnail.rs, tests/perf_test.rs, tests/scanner_test.rs（按路径排序）
+> 覆盖 hash：d76e8c5c0509（取前 12 位，由生成者用命令行工具计算）
 > 可信度：AI 生成未审
 > 状态：valid
 
 ## 职责
-核心层的索引与扫描子系统：SQLite schema 与 Repository、walkdir 递归扫描 + EXIF + 内容哈希 + 增量更新、缩略图缓存。不依赖 gpui，可在后台线程运行并独立测试。
+核心层的索引与扫描子系统：SQLite schema 与 Repository、walkdir 递归扫描 + EXIF + 内容哈希 + 增量更新、缩略图缓存。不依赖 gpui，可在后台线程运行并独立测试；M6 新增 5000 张性能基准（独立 `#[ignore]` 测试）。
 
 ## 对外接口
 **db.rs**
@@ -31,6 +31,9 @@
 - `pub const THUMBNAIL_SIZE: u32 = 400`。
 - `pub fn ensure_thumbnail(paths: &Paths, source: &Path, content_hash: &str) -> Result<PathBuf>`：确保缩略图存在并返回缓存路径。
 
+**tests/perf_test.rs（M6 性能基准，默认忽略）**
+- `#[test] #[ignore] fn bench_5000_photos()`：临时目录生成 5000 张 16×16 合成 PNG（颜色随序号变化，保证内容哈希互不相同），分 20 个子目录；测 `scanner::scan_root`、`LibraryData::reload`、`visible_photos()` ×100 耗时并用 `--nocapture` 打印；`AKASHIC_BENCH_COUNT` 可缩小规模。不测 O(n²) 的相似分析。
+
 ## 内部关键流程
 1. `scan_root` → `upsert_scan_root` 取 root_id → `WalkDir` 递归过滤（跳过 `.` 开头目录/trash/node_modules/target，只收图片扩展名）→ 逐张：EXIF（`exif::Reader`，`DateTimeOriginal`/`Make`/`Model`，失败退化为 mtime）→ `twox_hash::XxHash64` 内容哈希 → `ensure_thumbnail` → `image::image_dimensions` 取尺寸 → `upsert_photo`（事务内）→ 上报 `Scanning` 进度。
 2. 扫描结束 → `sweep_photos` 删除此根目录下不在本次存活集合的记录 → 提交事务 → 上报 `Finished{stats}`。
@@ -39,9 +42,11 @@
 5. M2 迁移分三阶段：①第一个 `execute_batch` 只建表 + 旧列索引；②用 `PRAGMA table_info(photos)` 检查后按需 `ALTER TABLE ADD COLUMN` 补齐 4 个分析列；③**补列之后**再单独 `execute_batch` 建 `idx_photos_blur`/`idx_photos_group`。查询统一用 `PHOTO_COLUMNS` 显式列清单（不用 `SELECT *`）以稳定列顺序。
 6. `upsert_photo` 在照片内容变化（size/mtime 变更）时清空blur_score/is_screenshot/phash/group_id，令分析结果失效待重算。
 
+7. M6 基准流程：`tests/perf_test.rs` 先生成合成图（不计入指标）→ `scan_root` 写库 → `LibraryData::reload` 冷启动 → `visible_photos()` 多次过滤；打印各段耗时与每张均值，断言索引数量与筛选结果，最后 `drop(conn)` 再清理临时目录。
+
 ## 依赖关系
 - 依赖的外部模块：`rusqlite`（bundled SQLite）、`kamadak-exif`、`walkdir`、`image`、`twox-hash`、`chrono`、`anyhow`；`core-model`（Photo/ScanStats/PhotoGroup/OpLog/OpEntry/TrashItem/OpKind）、`core-config`（Paths）。
-- 被谁依赖：`core-analyze`（db 读写分析结果）、`core-ops`（db 读写回收站/操作日志/归档设置）、`ui-desktop`（LibraryData/AnalyzeData/OpsData 通过 db 读数据、AppState 调用 scan_root 与 settings）、集成测试 `tests/scanner_test.rs` / `tests/analyze_test.rs` / `tests/ops_test.rs` / `tests/archive_test.rs`。
+- 被谁依赖：`core-analyze`（db 读写分析结果）、`core-ops`（db 读写回收站/操作日志/归档设置）、`ui-desktop`（LibraryData/AnalyzeData/OpsData 通过 db 读数据、AppState 调用 scan_root 与 settings）、集成测试 `tests/scanner_test.rs` / `tests/analyze_test.rs` / `tests/ops_test.rs` / `tests/archive_test.rs`；M6 性能基准 `tests/perf_test.rs` 直接调用 `scan_root` 与 `LibraryData::reload`。
 
 ## 常见改动点
 - 改 schema：在 `migrate` 加 `CREATE TABLE IF NOT EXISTS`/ALTER，同步 `row_to_photo` 列顺序与所有 SQL。
@@ -58,6 +63,7 @@
 - HEIC/HEIF 在 `IMAGE_EXTS` 中会被索引元数据，但 `image` 无法解码生成缩略图（本期无 HEIC 支持，属预期）。
 
 ## 变更记录
+- 2026-11-19：M6 新增 `tests/perf_test.rs`（5000 张扫描/冷启动/筛选基准，`#[ignore]`）；覆盖范围纳入 `tests/perf_test.rs` 与 `tests/scanner_test.rs` 并刷新 hash。
 - 2026-11-18 16:58：M4 新增 `get_setting`/`set_setting`（复用 M1 已有 `settings` 表，无 schema 变更）；`restore_photo` 增加归档 Copy 副本索引的调用场景，刷新 hash。
 - 2026-11-18 16:05：M3 schema 新增 op_log/op_entries/trash_items 三表与索引；db 新增按 id 查询/删除照片、恢复照片、重命名路径、操作日志与回收站 Repository，刷新 hash。
 - 2026-11-18 15:50：修复 M1 老库升级失败——把分析列索引创建移到补列之后，新增老库升级回归测试，刷新 hash。
