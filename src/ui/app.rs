@@ -872,6 +872,10 @@ impl Render for AppRoot {
             .id("content")
             .flex_1()
             .min_h_0()
+            // 关键：gpui 的 div() 默认是 Display::Block，子元素纵向堆叠且高度自适应。
+            // 不显式开 flex 的话，需要确定高度的页面（如相册库的 uniform_list）会拿不到高度。
+            .flex()
+            .flex_col()
             .bg(col(BG_WARM))
             .px(px(24.))
             .py(px(20.))
@@ -1842,8 +1846,7 @@ impl AppRoot {
                 .id("photo-grid-scroll")
                 .flex_1()
                 .min_h_0()
-                .size_full()
-                .child(list)
+                .child(list.size_full())
                 .into_any_element()
         };
 
@@ -1867,6 +1870,12 @@ impl AppRoot {
                     .child(
                         div()
                             .id("grid-info")
+                            // 默认 Block 会让「共 / 39 / 张照片」竖着堆叠，显式开 flex 横排。
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .gap(px(4.))
+                            .flex_none()
                             .text_color(col(TEXT_SECONDARY))
                             .child("共 ")
                             .child(
@@ -1975,6 +1984,10 @@ impl AppRoot {
 
         div()
             .id("page-library")
+            // flex_1：填满 content 剩余高度，给 library-layout → uniform_list 一条完整的
+            // 确定高度链（content → page-library → library-layout → grid_panel → 列表）。
+            .flex_1()
+            .min_h_0()
             .flex().flex_col()
             .child(status_bar)
             .child(ops_status)

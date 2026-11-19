@@ -49,6 +49,12 @@ MVP v1 首个可交付版本：本地优先的照片整理工具，全部功能�
     搜索框与重命名前缀输入框接入 `InputState`、首页「选择目录」真正弹目录框、批量按钮补禁用态、详情按钮随文件存在性禁用。
   - 回归测试：新增 22 个用例（文件移动安全/清洗、坏图分析、pHash 与聚类、截图启发式、LIKE 与 sweep、缩略图缓存、重命名模板、归档边界、保留期越界）；
     `cargo test` 共 63 个常规测试全绿 + 1 个 `#[ignore]` 性能基准，`cargo build` 通过。
+- **相册库网格整体不可见（用户实测，2026-11-19 11:33）**：显示「共 39 张照片」但下方无任何缩略图。根因是 gpui 的 `div()` 默认
+  `Display::Block` 而非 flex：`content` 未显式开 flex → 页面高度塌缩为内容高度 → `library-layout` 的 `flex_1` 无剩余空间 →
+  `uniform_list` 得不到确定高度、按 0 高度渲染；`grid-info` 的三个块级子元素也因此竖排堆叠。
+  修复：`content` 加 `.flex().flex_col()`、`page-library` 加 `flex_1().min_h_0()` 打通高度链、列表容器 `flex_1().min_h_0()`
+  且 `uniform_list` 本体 `.size_full()`、`grid-info` 改 `.flex().flex_row().items_baseline()`。
+  `cargo check` / `cargo build` 通过，`cargo test` 63 个常规测试全绿。
 
 ### 已知限制
 

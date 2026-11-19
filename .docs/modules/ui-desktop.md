@@ -1,13 +1,13 @@
 # 模块：ui-desktop
 
-> 生成时间：2026-11-19 10:38 +0800
+> 生成时间：2026-11-19 11:33 +0800
 > 覆盖范围：src/main.rs, src/ui/analyze.rs, src/ui/app.rs, src/ui/assets.rs, src/ui/library.rs, src/ui/mod.rs, src/ui/ops.rs（按路径排序）
-> 覆盖 hash：39be8ec58cf6（取前 12 位，由生成者用命令行工具计算）
+> 覆盖 hash：74ecc6abc6aa（取前 12 位，由生成者用命令行工具计算）
 > 可信度：AI 生成未审
 > 状态：valid
 
 ## 职责
-基于 gpui / gpui-component 的桌面 UI 层与组合根。M1 起相册库/首页读真实 SQLite 索引（目录选择/后台扫描/目录过滤/多选/照片详情）；M2 智能整理页 4 个分析工具接入分析与后台调度；M3 新增批量删除到回收站、批量重命名（预设模板+预览+一次撤销）、回收站页（恢复/清空/30 天清理/撤销），删除绝不永久丢失原文件；M4 新增智能归档页（4 种规则 / 移动·复制 / 完整目录树预览 / 执行 / 撤销），并把整理页「智能重命名」「智能归档」卡片与侧栏「智能整理」徽标改为真实可用。缩略图真图与详情原图预览在 16:35 补充修复中提前完成。M5 完成体验闭环：首页统计/整理进度/最近操作全部接真实数据并补加载/空/错误态，新增设置与隐私中心（本机路径/保留期/数据概况/隐私说明）、窗口尺寸自适应与最小尺寸、图标注册补全、清理 M0 模拟数据与重写 readme。M6 把相册库网格改为 gpui `uniform_list` 虚拟滚动（每行 4 张、等高，只构造视口内的行）。2026-11-19 全量审查后修复：多选按照片 id、后台 channel 每轮排空、全局错误横幅、搜索框/重命名前缀输入框接 `InputState`、首页「选择目录」真正弹目录框、按钮禁用态、目录树子节点路径、弹窗按钮随文件存在性禁用。
+基于 gpui / gpui-component 的桌面 UI 层与组合根。M1 起相册库/首页读真实 SQLite 索引（目录选择/后台扫描/目录过滤/多选/照片详情）；M2 智能整理页 4 个分析工具接入分析与后台调度；M3 新增批量删除到回收站、批量重命名（预设模板+预览+一次撤销）、回收站页（恢复/清空/30 天清理/撤销），删除绝不永久丢失原文件；M4 新增智能归档页（4 种规则 / 移动·复制 / 完整目录树预览 / 执行 / 撤销），并把整理页「智能重命名」「智能归档」卡片与侧栏「智能整理」徽标改为真实可用。缩略图真图与详情原图预览在 16:35 补充修复中提前完成。M5 完成体验闭环：首页统计/整理进度/最近操作全部接真实数据并补加载/空/错误态，新增设置与隐私中心（本机路径/保留期/数据概况/隐私说明）、窗口尺寸自适应与最小尺寸、图标注册补全、清理 M0 模拟数据与重写 readme。M6 把相册库网格改为 gpui `uniform_list` 虚拟滚动（每行 4 张、等高，只构造视口内的行）。2026-11-19 全量审查后修复：多选按照片 id、后台 channel 每轮排空、全局错误横幅、搜索框/重命名前缀输入框接 `InputState`、首页「选择目录」真正弹目录框、按钮禁用态、目录树子节点路径、弹窗按钮随文件存在性禁用。2026-11-19 11:33 修复相册库网格整体不可见：gpui `div()` 默认 `Display::Block`（非 flex），`content` 未显式开 flex 导致页面高度链断裂、`uniform_list` 拿不到确定高度渲染为 0，`grid-info` 的三个块级子元素竖排塌缩；修复为 `content` 显式 `.flex().flex_col()`、`page-library` 加 `flex_1().min_h_0()`、列表容器 `flex_1().min_h_0()` + `uniform_list` 本体 `.size_full()`、`grid-info` 加 `.flex().flex_row().items_baseline()`。
 
 ## 对外接口
 - `pub struct AppState`：字段 `page/paths/data/active_folder_id/folder_expanded/selected/scan_status/is_scanning/progress_rx/analyze_data/analyze_rx/is_analyzing/analyze_status/active_tool/ops_data/ops_status/rename_pattern/rename_prefix/last_rename_op/last_trash_op`（私有）；M4 追加 `archive_dest: PathBuf/archive_rule: ArchiveRule/archive_mode: ArchiveMode/archive_scope_all: bool/archive_plan: Option<ArchivePlan>/last_archive_op: Option<i64>`；M5 追加 `load_error: Option<String>`（启动/刷新索引失败）、`last_error: Option<String>`（最近后台任务失败）、`retention_days: i64`。2026-11-19：`selected` 由 `HashSet<usize>`（可见下标）改为 `HashSet<i64>`（照片 id）；新增 `pending_analysis: bool`（分析忙时排队，避免自动分析被静默丢弃）；`reload_all()` 失败时写 `last_error` 并保留 `active_folder`/`keyword`/`active_folder_id`，不再 `unwrap_or_default()` 清空快照，同时清空 `selected`。
@@ -36,7 +36,7 @@
 1. `main.rs` 构造 Paths → `new_app_state(cx, paths)` → 内部 `db::open` + `LibraryData::reload` 加载已有索引 → `AppRoot::new` → `Root::new`。
 2. 相册库 / 首页「选择目录」→ `rfd::FileDialog::pick_folder` → `app.update(...start_scan(root))` → 后台线程打开独立 DB 连接执行 `scanner::scan_root`，进度经 `mpsc::channel` 回传。
 3. `cx.spawn` 异步任务每 150ms 用 `gpui::background_executor().timer()` 轮询 channel：**每轮用 `try_iter()` 排空全部消息**（此前每轮只收一条，进度消息积压会让 UI 永远停在「扫描中/分析中」）；`Started/Scanning` 更新 `scan_status`，`Finished/Failed` 重新 `reload_all()` 并 `cx.notify()`；entity 释放时 break。
-4. `page_library` 从 `data.visible_photos()` 克隆为 owned `Vec<Photo>`，按目录前缀 + 关键词过滤（`keyword` 由搜索框 `InputState` 写入）；M6 起用 `uniform_list("photo-virtual-grid", row_count, f)` 按 `GRID_COLUMNS=4` 张一行 lazy 渲染，闭包只构造 `range` 内的行；每行 4 个 `Button` 用 `photo_thumb` 显示真实缩略图；`render_folder_tree` 递归渲染 `data.folders`。
+4. `page_library` 从 `data.visible_photos()` 克隆为 owned `Vec<Photo>`，按目录前缀 + 关键词过滤（`keyword` 由搜索框 `InputState` 写入）；M6 起用 `uniform_list("photo-virtual-grid", row_count, f)` 按 `GRID_COLUMNS=4` 张一行 lazy 渲染，闭包只构造 `range` 内的行；每行 4 个 `Button` 用 `photo_thumb` 显示真实缩略图；`render_folder_tree` 递归渲染 `data.folders`。**高度链（2026-11-19 修复）**：`content`（`.flex().flex_col()`）→ `page-library`（`flex_1().min_h_0()`）→ `library-layout`（`flex_1()`）→ `grid-panel`（`flex_1()`）→ `photo-grid-scroll`（`flex_1().min_h_0()`）→ `uniform_list`（`.size_full()`）；任一环节缺确定高度都会让虚拟列表渲染为 0 高度。
 5. 照片点击：`ev.modifiers().control || ev.modifiers().platform` 时按 **`photo.id`** 插入 / 移除 `selected`（不再用可见下标，避免筛选或排序后删错照片）；普通点击调 `open_photo_dialog(dialog_photo.clone(), window, cx)`。
 6. 首页 `page_home`（M5 重写）：4 张真实统计卡来自 `data.total_count/total_bytes/root_count/visible_photos().len()`；状态横幅按「错误态 > 加载态 > 隐藏」渲染；「整理进度」显示 `AnalyzeData` 真实计数；「最近整理记录」取 `OpsData.recent_ops` 前 6 条，用 `OpKind::label()` + `item_count` + `format_millis` + `truncate`，空列表显示引导空态。
 7. **M2 分析链路**：扫描 `Finished` 后自动调用 `start_analysis`（也可整理页点「重新分析」手动触发）；分析忙时用 `pending_analysis` 排队而非静默丢弃 → 后台线程 `core::analyze::analyze_library` 写库 → `AnalyzeProgress` 经 channel 回传 → 第二个 `cx.spawn` 轮询（200ms，每轮排空）刷新 `analyze_status` 与 `AnalyzeData::reload`；完成后 `reload_all()`。
