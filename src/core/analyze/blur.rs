@@ -14,7 +14,8 @@ pub const ANALYSIS_SIZE: u32 = 256;
 
 /// Laplacian 方差低于此值判定为模糊。
 /// 阈值针对 ANALYSIS_SIZE 的灰度图经验设定，可通过测试样本微调。
-pub const BLUR_THRESHOLD: f64 = 100.0;
+/// 常量定义在 model 层，db 的模糊列表查询复用同一口径。
+pub use crate::core::model::BLUR_THRESHOLD;
 
 /// 计算一张图片的模糊评分（Laplacian 方差，越大越清晰）。
 pub fn blur_score(path: &Path) -> Result<f64> {
@@ -33,6 +34,11 @@ pub fn is_blurry(score: f64) -> bool {
 ///
 /// 分离为独立函数便于合成样本测试（无需落盘）。
 pub fn laplacian_variance(gray: &GrayImage) -> f64 {
+    // 0×0 / 1×1 的损坏图直接返回，避免空图进入 resize 产生异常或 panic。
+    let (src_w, src_h) = gray.dimensions();
+    if src_w < 3 || src_h < 3 {
+        return 0.0;
+    }
     let resized: GrayImage =
         image::imageops::resize(gray, ANALYSIS_SIZE, ANALYSIS_SIZE, FilterType::Triangle);
     let (w, h) = resized.dimensions();

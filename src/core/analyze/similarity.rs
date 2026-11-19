@@ -1,4 +1,4 @@
-//! 相似归组：pHash 感知哈希预筛 + dssim 结构相似度精排 + 并查集分组。
+//! 相似归组：pHash 感知哈希预筛 + dssim 结构相似度精排 + 代表元聚类分组。
 //!
 //! 不依赖 gpui，可独立单元测试。pHash 部分为纯算法（合成灰度图即可测试），
 //! dssim 精排单独封装，便于在无缩略图测试样本时跳过。
@@ -64,19 +64,30 @@ pub fn phash_from_gray(gray: &GrayImage) -> Option<u64> {
         }
     }
 
-    // 取左上 8x8 低频系数，以中位数为阈值生成 64 位
+    // 取左上 8x8 低频系数。DC（均值亮度）会让所有纯色/低对比图得到同样的哈希，
+    // 因此先检测 AC 系数的动态范围：无纹理图返回 None，不参与相似分组。
     let mut vals = Vec::with_capacity(LOW_FREQ * LOW_FREQ);
     for y in 0..LOW_FREQ {
         for x in 0..LOW_FREQ {
-            vals.push(dct[y * size + x]);
+            let v = dct[y * size + x];
+            if !v.is_finite() {
+                return None;
+            }
+            vals.push(v);
         }
     }
-    let mut sorted = vals.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = sorted[sorted.len() / 2];
+    let ac: Vec<f64> = vals.iter().skip(1).copied().collect();
+    let min = ac.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = ac.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !min.is_finite() || !max.is_finite() || (max - min).abs() < 1e-6 {
+        // 纯色、纯渐变或极低对比图没有可比较的结构特征。
+        return None;
+    }
+    // 阈值用 AC 均值（不含 DC），比中位数更稳定；DC 位保留但对所有图基本一致。
+    let mean = ac.iter().sum::<f64>() / ac.len() as f64;
     let mut hash = 0u64;
     for (i, v) in vals.iter().enumerate() {
-        if *v > median {
+        if *v > mean {
             hash |= 1u64 << i;
         }
     }
@@ -96,58 +107,30 @@ pub fn hamming(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
 
-/// 基于 pHash 汉明距离做并查集分组。
+/// 基于 pHash 汉明距离做「代表元」聚类。
 ///
 /// 输入为 `(照片 id, phash)` 列表，返回每组至少 2 张的照片 id 集合。
+/// 用代表元而非并查集传递闭包：A~B、B~C 但 A≁C 时不应串成一个巨组。
 pub fn group_by_phash(items: &[(i64, u64)], max_dist: u32) -> Vec<Vec<i64>> {
-    struct UnionFind {
-        parent: Vec<usize>,
-    }
-    impl UnionFind {
-        fn new(n: usize) -> Self {
-            Self {
-                parent: (0..n).collect(),
+    let mut representatives: Vec<u64> = Vec::new();
+    let mut groups: Vec<Vec<i64>> = Vec::new();
+
+    for &(id, hash) in items {
+        let mut placed = false;
+        for (i, rep) in representatives.iter().enumerate() {
+            if hamming(hash, *rep) <= max_dist {
+                groups[i].push(id);
+                placed = true;
+                break;
             }
         }
-        fn find(&mut self, x: usize) -> usize {
-            if self.parent[x] != x {
-                let root = self.find(self.parent[x]);
-                self.parent[x] = root;
-            }
-            self.parent[x]
-        }
-        fn union(&mut self, a: usize, b: usize) {
-            let ra = self.find(a);
-            let rb = self.find(b);
-            if ra != rb {
-                self.parent[rb] = ra;
-            }
+        if !placed {
+            representatives.push(hash);
+            groups.push(vec![id]);
         }
     }
 
-    let n = items.len();
-    if n < 2 {
-        return Vec::new();
-    }
-    let mut uf = UnionFind::new(n);
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if hamming(items[i].1, items[j].1) <= max_dist {
-                uf.union(i, j);
-            }
-        }
-    }
-
-    use std::collections::HashMap;
-    let mut groups: HashMap<usize, Vec<i64>> = HashMap::new();
-    for i in 0..n {
-        let root = uf.find(i);
-        groups.entry(root).or_default().push(items[i].0);
-    }
-    let mut result: Vec<Vec<i64>> = groups
-        .into_values()
-        .filter(|g| g.len() >= 2)
-        .collect();
+    let mut result: Vec<Vec<i64>> = groups.into_iter().filter(|g| g.len() >= 2).collect();
     for g in &mut result {
         g.sort_unstable();
     }

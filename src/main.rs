@@ -10,11 +10,17 @@ use akashic::ui::assets::Assets;
 
 fn main() {
     // 确保本机应用数据目录就绪（索引、缓存、回收站）。
+    // 系统应用数据目录不可用时回退到用户主目录下的持久目录；
+    // 临时目录会被系统清理，不能用来存放索引库和回收站里的原文件。
     let paths = Paths::platform_default().unwrap_or_else(|| {
-        Paths::from_app_dir(std::env::temp_dir().join("akashic"))
+        dirs::home_dir()
+            .map(|h| Paths::from_app_dir(h.join(".akashic")))
+            .unwrap_or_else(|| Paths::from_app_dir(std::env::temp_dir().join("akashic")))
     });
     if let Err(e) = paths.ensure_dirs() {
-        eprintln!("[akashic] 无法初始化本地目录: {e}");
+        // 目录建不起来时 db::open 必然失败，继续启动只会得到一个所有操作静默失败的界面。
+        eprintln!("[akashic] 无法初始化本地目录，应用无法启动: {e}");
+        return;
     }
 
     let app = gpui::Application::new().with_assets(Assets);
@@ -32,11 +38,14 @@ fn main() {
                 ..WindowOptions::default()
             };
             let paths_for_window = paths.clone();
-            cx.open_window(options, |window, cx| {
+            if let Err(e) = cx.open_window(options, |window, cx| {
                 let state = new_app_state(cx, paths_for_window);
                 let view = cx.new(|_| AppRoot::new(state));
                 cx.new(|cx| Root::new(view, window, cx))
-            })?;
+            }) {
+                // detach() 会丢弃 Result，不打印就只剩一个无窗口的空事件循环。
+                eprintln!("[akashic] 创建窗口失败: {e}");
+            }
             Ok::<_, anyhow::Error>(())
         })
         .detach();

@@ -75,7 +75,9 @@ impl LibraryData {
     }
 }
 
-/// 从索引照片路径派生两层目录树（根目录 → 一级子目录）。
+/// 从索引照片路径派生目录树（根目录 → 直接父目录）。
+/// 子节点 path 必须是完整的相对目录（如 `root/2024/08`），
+/// 否则多级子目录点击后 `starts_with` 过滤会找不到任何照片。
 fn build_folder_tree(conn: &Connection, roots: &[crate::core::model::ScanRoot]) -> anyhow::Result<Vec<Folder>> {
     let photos = db::list_photos(conn)?;
     let mut tree: Vec<Folder> = Vec::new();
@@ -87,7 +89,7 @@ fn build_folder_tree(conn: &Connection, roots: &[crate::core::model::ScanRoot]) 
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| root_path.to_string_lossy().to_string());
 
-        let mut children: BTreeMap<String, usize> = BTreeMap::new();
+        let mut child_dirs: BTreeMap<PathBuf, usize> = BTreeMap::new();
         let mut root_count = 0usize;
         for photo in &photos {
             if !photo.path.starts_with(root_path) {
@@ -95,23 +97,34 @@ fn build_folder_tree(conn: &Connection, roots: &[crate::core::model::ScanRoot]) 
             }
             root_count += 1;
             if let Ok(rel) = photo.path.strip_prefix(root_path) {
-                let sub = rel
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "（根目录）".to_string());
-                *children.entry(sub).or_insert(0) += 1;
+                // 根目录下直接摆放的照片归入根节点本身，不造「（根目录）」这种不存在的路径。
+                if let Some(parent_rel) = rel.parent() {
+                    if !parent_rel.as_os_str().is_empty() {
+                        child_dirs.insert(root_path.join(parent_rel), 0);
+                    }
+                }
             }
         }
+        // 计数按「该目录及其子目录」统计，保证节点显示数与点击后网格数一致。
+        for (dir, count) in child_dirs.iter_mut() {
+            *count = photos.iter().filter(|p| p.path.starts_with(dir)).count();
+        }
 
-        let child_nodes: Vec<Folder> = children
+        let child_nodes: Vec<Folder> = child_dirs
             .into_iter()
-            .map(|(name, count)| Folder {
-                id: format!("{}|{}", root.id, name),
-                name: name.clone(),
-                path: root_path.join(&name),
-                photo_count: count,
-                children: vec![],
+            .map(|(path, count)| {
+                let name = path
+                    .strip_prefix(root_path)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                Folder {
+                    id: format!("{}|{}", root.id, path.to_string_lossy()),
+                    name,
+                    path,
+                    photo_count: count,
+                    children: vec![],
+                }
             })
             .collect();
 

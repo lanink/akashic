@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::core::model::{Photo, ScanRoot};
+use crate::core::model::{Photo, ScanRoot, BLUR_THRESHOLD};
 
 /// 打开（或创建）索引库并执行迁移。
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("打开索引库失败: {}", path.display()))?;
+    // 扫描是长事务，其它连接（UI 刷新/分析）不该因瞬时写锁直接失败。
+    conn.busy_timeout(std::time::Duration::from_secs(10))
+        .context("设置 SQLite busy_timeout 失败")?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -209,28 +212,40 @@ pub fn get_photo_by_path(conn: &Connection, path: &Path) -> Result<Option<Photo>
     .context("查询照片失败")
 }
 
-/// 插入或更新一张照片（基于路径 + 大小 + 修改时间判断是否需要更新）。
-/// 返回 true 表示新增，false 表示跳过（未变化）。
-pub fn upsert_photo(conn: &Connection, photo: &Photo, root_id: i64) -> Result<bool> {
+/// 插入或更新一张照片（基于路径 + 大小 + 修改时间 + 内容哈希判断是否需要更新）。
+/// 返回三态，供扫描统计区分新增 / 更新 / 未变化。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpsertOutcome {
+    Added,
+    Updated,
+    Skipped,
+}
+
+pub fn upsert_photo(conn: &Connection, photo: &Photo, root_id: i64) -> Result<UpsertOutcome> {
     let path_str = photo.path.to_string_lossy();
-    let existing: Option<(i64, i64, i64)> = conn
+    let existing: Option<(i64, i64, i64, String)> = conn
         .query_row(
-            "SELECT id, size_bytes, modified_at FROM photos WHERE path = ?1",
+            "SELECT id, size_bytes, modified_at, content_hash FROM photos WHERE path = ?1",
             params![path_str],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
 
-    let changed = match existing {
-        Some((_, size, modified)) => size != photo.size_bytes || modified != photo.modified_at,
+    // 内容哈希也纳入比较：原地替换文件但保持大小/mtime 时必须刷新缓存 key 与分析结果。
+    let changed = match &existing {
+        Some((_, size, modified, hash)) => {
+            *size != photo.size_bytes
+                || *modified != photo.modified_at
+                || *hash != photo.content_hash
+        }
         None => true,
     };
 
     if !changed {
-        return Ok(false);
+        return Ok(UpsertOutcome::Skipped);
     }
 
-    if let Some((id, _, _)) = existing {
+    if let Some((id, _, _, _)) = existing {
         conn.execute(
             "UPDATE photos SET file_name=?2, size_bytes=?3, date_taken=?4, modified_at=?5,
                     width=?6, height=?7, device=?8, location=?9, tags=?10, content_hash=?11,
@@ -255,6 +270,7 @@ pub fn upsert_photo(conn: &Connection, photo: &Photo, root_id: i64) -> Result<bo
                 root_id,
             ],
         )?;
+        Ok(UpsertOutcome::Updated)
     } else {
         conn.execute(
             "INSERT INTO photos (path, file_name, size_bytes, date_taken, modified_at,
@@ -279,8 +295,8 @@ pub fn upsert_photo(conn: &Connection, photo: &Photo, root_id: i64) -> Result<bo
                 root_id,
             ],
         )?;
+        Ok(UpsertOutcome::Added)
     }
-    Ok(true)
 }
 
 /// 按 id 查询单张照片。
@@ -302,13 +318,27 @@ pub fn list_photos(conn: &Connection) -> Result<Vec<Photo>> {
 }
 
 /// 列出指定扫描根目录下（路径前缀匹配）的照片。
+/// LIKE 通配符必须转义：目录名含 `%` / `_`（如 `2024_旅行`）时否则会越界匹配。
 pub fn list_photos_under(conn: &Connection, root: &Path) -> Result<Vec<Photo>> {
-    let prefix = format!("{}%", root.to_string_lossy());
+    let prefix = format!("{}%", escape_like(&root.to_string_lossy()));
     let mut stmt = conn.prepare(&format!(
-        "SELECT {PHOTO_COLUMNS} FROM photos WHERE path LIKE ?1 ORDER BY date_taken DESC, id DESC"
+        "SELECT {PHOTO_COLUMNS} FROM photos WHERE path LIKE ?1 ESCAPE '\\' \
+         ORDER BY date_taken DESC, id DESC"
     ))?;
     let rows = stmt.query_map(params![prefix], row_to_photo)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().context("按目录列出照片失败")
+}
+
+/// 转义 LIKE 模式中的 `%` `_` `\`。
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// 按关键词搜索文件名 / 地点 / 标签。
@@ -401,18 +431,23 @@ pub fn list_photo_groups(conn: &Connection) -> Result<Vec<crate::core::model::Ph
         let members = mstmt
             .query_map(params![id], row_to_photo)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        // 照片被删除/清理后组内可能只剩 0 或 1 张，不再作为「相似组」展示。
+        if members.len() < 2 {
+            continue;
+        }
         groups.push(PhotoGroup { id, rule, created_at, members });
     }
     Ok(groups)
 }
 
-/// 按模糊分升序返回最模糊的 N 张（仅已分析照片）。
+/// 按模糊分升序返回判定为模糊的 N 张（仅已分析且低于阈值的照片）。
 pub fn list_blurry(conn: &Connection, limit: usize) -> Result<Vec<Photo>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {PHOTO_COLUMNS} FROM photos WHERE blur_score IS NOT NULL \
-         ORDER BY blur_score ASC LIMIT ?1"
+        "SELECT {PHOTO_COLUMNS} FROM photos \
+         WHERE blur_score IS NOT NULL AND blur_score < ?2 \
+         ORDER BY blur_score ASC, id ASC LIMIT ?1"
     ))?;
-    stmt.query_map(params![limit as i64], row_to_photo)?
+    stmt.query_map(params![limit as i64, BLUR_THRESHOLD], row_to_photo)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .context("查询模糊照片失败")
 }
@@ -444,16 +479,27 @@ pub fn count_analyzed(conn: &Connection) -> Result<i64> {
         .context("统计已分析照片数失败")
 }
 
-/// 增量扫描清理：删除指定扫描根目录下、不在本次存活路径集合中的照片记录。
-/// `root` 为扫描根目录，`alive_paths` 为本次扫描实际找到的绝对路径。
-pub fn sweep_photos(conn: &Connection, root: &Path, alive_paths: &[PathBuf]) -> Result<usize> {
-    let existing = list_photos_under(conn, root)?;
-    let alive: std::collections::HashSet<&Path> = alive_paths.iter().map(|p| p.as_path()).collect();
+/// 增量扫描清理：删除指定扫描根下、不在本次存活路径集合中的照片记录。
+///
+/// 按 `scan_root_id` 精确取候选，不再用未转义的路径前缀 LIKE（目录名含 `%`/`_`、
+/// 前缀重叠、大小写差异都会误删别的扫描根的记录）。路径比较统一使用入库时的
+/// `to_string_lossy()` 表示，避免非 UTF-8 文件名每次扫描都被判为「不存活」。
+/// 不在此处开启事务：调用方（scanner）已持有事务，嵌套事务会失败。
+pub fn sweep_photos(conn: &Connection, root_id: i64, alive_paths: &[PathBuf]) -> Result<usize> {
+    let existing: Vec<Photo> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PHOTO_COLUMNS} FROM photos WHERE scan_root_id = ?1"
+        ))?;
+        stmt.query_map(params![root_id], row_to_photo)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let alive: std::collections::HashSet<String> = alive_paths
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
     let mut removed = 0;
-    // 不在此处开启事务：调用方（scanner）已持有事务，嵌套事务会失败。
-    // 单独调用时每条 DELETE 各自自动提交。
     for photo in existing {
-        if !alive.contains(photo.path.as_path()) {
+        if !alive.contains(&photo.path.to_string_lossy().to_string()) {
             conn.execute("DELETE FROM photos WHERE id = ?1", params![photo.id])?;
             removed += 1;
         }
@@ -635,7 +681,7 @@ pub fn list_expired_trash(conn: &Connection, cutoff: i64) -> Result<Vec<TrashIte
         "SELECT id, op_id, original_path, trash_path, trashed_at,
                 file_name, size_bytes, date_taken, modified_at, width, height,
                 device, location, tags, content_hash, thumbnail_path, scan_root_id
-         FROM trash_items WHERE trashed_at <= ?1 ORDER BY trashed_at",
+         FROM trash_items WHERE trashed_at < ?1 ORDER BY trashed_at",
     )?;
     stmt.query_map(params![cutoff], row_to_trash_item)?
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -822,15 +868,15 @@ mod tests {
         assert!(root > 0);
 
         let p = sample_photo("/photos/trip/IMG_0001.jpg", 1000, 100);
-        assert!(upsert_photo(&conn, &p, root)?); // 新增
+        assert_eq!(upsert_photo(&conn, &p, root)?, UpsertOutcome::Added);
         assert_eq!(count_photos(&conn)?, 1);
 
         // 未变化则跳过
-        assert!(!upsert_photo(&conn, &p, root)?);
+        assert_eq!(upsert_photo(&conn, &p, root)?, UpsertOutcome::Skipped);
 
         // 修改后更新
         let p2 = sample_photo("/photos/trip/IMG_0001.jpg", 2000, 200);
-        assert!(upsert_photo(&conn, &p2, root)?);
+        assert_eq!(upsert_photo(&conn, &p2, root)?, UpsertOutcome::Updated);
         assert_eq!(count_photos(&conn)?, 1);
         let fetched = get_photo_by_path(&conn, Path::new("/photos/trip/IMG_0001.jpg"))?.unwrap();
         assert_eq!(fetched.size_bytes, 2000);
@@ -850,6 +896,63 @@ mod tests {
         // 删除根目录级联清理照片
         delete_scan_root(&conn, root)?;
         assert_eq!(count_photos(&conn)?, 0);
+        Ok(())
+    }
+
+    /// 回归：原地替换文件但保持 size/mtime 不变时，内容哈希变化也必须刷新索引，
+    /// 否则缩略图缓存 key 与旧分析结果会一直沿用。
+    #[test]
+    fn upsert_detects_content_hash_change() -> Result<()> {
+        let conn = open_in_memory()?;
+        let root = upsert_scan_root(&conn, Path::new("/photos/trip"))?;
+        let mut p = sample_photo("/photos/trip/IMG_0001.jpg", 1000, 100);
+        assert_eq!(upsert_photo(&conn, &p, root)?, UpsertOutcome::Added);
+        assert_eq!(upsert_photo(&conn, &p, root)?, UpsertOutcome::Skipped);
+
+        p.content_hash = "new-hash".to_string();
+        assert_eq!(upsert_photo(&conn, &p, root)?, UpsertOutcome::Updated);
+        let fetched = get_photo_by_path(&conn, &p.path)?.unwrap();
+        assert_eq!(fetched.content_hash, "new-hash");
+        Ok(())
+    }
+
+    /// 回归：目录名含 LIKE 通配符 `%` / `_` 时不得越界匹配到别的目录。
+    #[test]
+    fn list_photos_under_escapes_like_wildcards() -> Result<()> {
+        let conn = open_in_memory()?;
+        let root = upsert_scan_root(&conn, Path::new("/photos"))?;
+        let a = sample_photo("/photos/2024_旅行/a.jpg", 100, 100);
+        let b = sample_photo("/photos/2024X旅行/b.jpg", 100, 100);
+        let c = sample_photo("/photos/100%真实/c.jpg", 100, 100);
+        for p in [&a, &b, &c] {
+            upsert_photo(&conn, p, root)?;
+        }
+
+        let under = list_photos_under(&conn, Path::new("/photos/2024_旅行"))?;
+        assert_eq!(under.len(), 1, "_ 不得被 LIKE 当通配符");
+        assert_eq!(under[0].file_name, "a.jpg");
+
+        let under_pct = list_photos_under(&conn, Path::new("/photos/100%真实"))?;
+        assert_eq!(under_pct.len(), 1, "% 不得被 LIKE 当通配符");
+        assert_eq!(under_pct[0].file_name, "c.jpg");
+        Ok(())
+    }
+
+    /// 回归：sweep 按 scan_root_id 精确清理，不误删其他扫描根的记录。
+    #[test]
+    fn sweep_photos_is_scoped_to_scan_root() -> Result<()> {
+        let conn = open_in_memory()?;
+        let r1 = upsert_scan_root(&conn, Path::new("/photos/r1"))?;
+        let r2 = upsert_scan_root(&conn, Path::new("/photos/r2"))?;
+        let p1 = sample_photo("/photos/r1/a.jpg", 100, 100);
+        let p2 = sample_photo("/photos/r2/b.jpg", 100, 100);
+        upsert_photo(&conn, &p1, r1)?;
+        upsert_photo(&conn, &p2, r2)?;
+        assert_eq!(count_photos(&conn)?, 2);
+
+        assert_eq!(sweep_photos(&conn, r1, &[])?, 1);
+        assert_eq!(count_photos(&conn)?, 1, "不得误删 r2 的记录");
+        assert!(get_photo_by_path(&conn, &p2.path)?.is_some());
         Ok(())
     }
 

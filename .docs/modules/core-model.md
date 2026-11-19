@@ -1,15 +1,16 @@
 # 模块：core-model
 
-> 生成时间：2026-11-18 17:40 +0800
+> 生成时间：2026-11-19 10:38 +0800
 > 覆盖范围：src/core/config.rs, src/core/mod.rs, src/core/model.rs（按路径排序）
-> 覆盖 hash：ac090fe9eac2（取前 12 位，由生成者用命令行工具计算）
+> 覆盖 hash：f8ad5300fb64（取前 12 位，由生成者用命令行工具计算）
 > 可信度：AI 生成未审
 > 状态：valid
 
 ## 职责
-核心层的数据模型与本地路径配置，不依赖 gpui，可独立单元测试。`Photo` 在 M1 真实字段基础上，M2 新增 4 个分析字段与 `PhotoGroup` 相似分组模型；M3 新增批量操作/回收站模型（`OpKind/OpLog/OpEntry/TrashItem/TrashResult/RenameContext/RenamePreview(Item)/RenameResult`）。M4 仅扩展 `OpKind`（`ArchiveMove`/`ArchiveCopy`），归档规则/计划/树/结果模型定义在 `core-ops`（`src/core/ops/archive.rs`），`Photo` 字段本身在 M3/M4 未变。M5 删除全部 M0 模拟数据（`PhotoDef/PHOTOS/FolderNode/folder_defs()/expandable_id()`），全应用不再出现模拟统计数字；`OpKind` 新增 `label()` 中文展示名并补单元测试。
+核心层的数据模型与本地路径配置，不依赖 gpui，可独立单元测试。`Photo` 在 M1 真实字段基础上，M2 新增 4 个分析字段与 `PhotoGroup` 相似分组模型；M3 新增批量操作/回收站模型（`OpKind/OpLog/OpEntry/TrashItem/TrashResult/RenameContext/RenamePreview(Item)/RenameResult`）。M4 仅扩展 `OpKind`（`ArchiveMove`/`ArchiveCopy`），归档规则/计划/树/结果模型定义在 `core-ops`（`src/core/ops/archive.rs`），`Photo` 字段本身在 M3/M4 未变。M5 删除全部 M0 模拟数据（`PhotoDef/PHOTOS/FolderNode/folder_defs()/expandable_id()`），全应用不再出现模拟统计数字；`OpKind` 新增 `label()` 中文展示名并补单元测试。2026-11-19 新增共享常量 `BLUR_THRESHOLD`，供 `analyze::blur` 与 `db::list_blurry` 共用同一模糊阈值，避免两处漂移。
 
 ## 对外接口
+- `pub const BLUR_THRESHOLD: f64 = 100.0`（src/core/model.rs）：Laplacian 方差低于此值判定为模糊；`analyze::blur` 通过 `pub use` 重导出，`db::list_blurry` 直接引用。
 - `pub struct Photo`（src/core/model.rs）：字段 `id/path/file_name/size_bytes/date_taken/modified_at/width/height/device/location/tags/content_hash/thumbnail_path/gps_lon_wgs84/gps_lat_wgs84/blur_score/is_screenshot/phash/group_id` 均 `pub`。M2 新增：`blur_score: Option<f64>`、`is_screenshot: bool`、`phash: Option<u64>`、`group_id: Option<i64>`。
 - `Photo` 方法：`size_label()`、`file_size_label()`、`date_label()`、`tag_list()`、`is_analyzed() -> bool`（blur_score 有值即为已分析）。
 - `pub struct PhotoGroup`（M2）：`id/rule/created_at/members: Vec<Photo>`，对应 `photo_groups` 表 + 成员。
@@ -32,11 +33,12 @@
 
 ## 依赖关系
 - 依赖的外部模块：`dirs`（应用数据目录）、`std::fs`/`std::path`。
-- 被谁依赖：`core-scanner`（构造 Photo/ScanStats）、`core-analyze`（PhotoAnalysis/PhotoGroup）、`core-ops`（TrashItem/OpLog/OpEntry/RenameContext 等）、`ui-desktop`（LibraryData/AnalyzeData/OpsData 消费）、`main.rs`（Paths）。
+- 被谁依赖：`core-scanner`（构造 Photo/ScanStats）、`core-analyze`（PhotoAnalysis/PhotoGroup/BLUR_THRESHOLD）、`core-ops`（TrashItem/OpLog/OpEntry/RenameContext 等）、`ui-desktop`（LibraryData/AnalyzeData/OpsData 消费）、`main.rs`（Paths）。
 
 ## 常见改动点
 - 新增照片字段：在 `Photo` 加字段 → 同步 `db.rs` 的 schema、`PHOTO_COLUMNS`、`row_to_photo`、`upsert_photo` 与所有构造处（scanner/analyze 测试）。
 - 调整展示格式：改 `Photo::*_label` 方法。
+- 调整模糊阈值：只改 `model.rs` 的 `BLUR_THRESHOLD`，勿在 `blur.rs` / `db.rs` 各写一份。
 - 新增进度类型：扩展 `ScanProgress` 或 `AnalyzeProgress` 并同步 UI 轮询处理。
 - 新增展示文案：优先在 core 模型上加方法（如 `OpKind::label()`），避免 UI 层散落硬编码字符串。
 - M0 模拟数据已在 M5 清除，勿再引入任何示例照片/目录常量。
@@ -48,6 +50,7 @@
 - 本模块不得引入 gpui 依赖。
 
 ## 变更记录
+- 2026-11-19 10:38：新增共享常量 `BLUR_THRESHOLD`（消除 blur 与 db 两处阈值漂移）；刷新 hash。
 - 2026-11-18 17:40：M5 删除 M0 模拟数据（PhotoDef/PHOTOS/FolderNode/folder_defs/expandable_id），新增 `OpKind::label()` 与往返单测，刷新 hash。
 - 2026-11-18 16:58：M4 为 `OpKind` 新增 `ArchiveMove`/`ArchiveCopy`（`as_str` = `archive_move`/`archive_copy`），Photo 字段未变，刷新 hash。
 - 2026-11-18 16:05：M3 新增批量操作/回收站与重命名模型（OpKind/OpLog/OpEntry/TrashItem/TrashResult/RenameContext/RenamePreview/RenameResult），Photo 字段未变，刷新 hash。

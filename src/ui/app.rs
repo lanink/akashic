@@ -7,6 +7,8 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::*;
 use gpui_component::dialog::Dialog;
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::Disableable;
 use gpui_component::Icon;
 use gpui_component::IconName;
 use gpui_component::WindowExt;
@@ -81,7 +83,9 @@ pub struct AppState {
     data: LibraryData,
     active_folder_id: Option<String>,
     folder_expanded: HashSet<String>, // 展开的目录 id 集合
-    selected: HashSet<usize>,
+    /// 多选集合存照片 id，而非「当前可见列表下标」。
+    /// 列表按拍摄时间倒序，任何扫描/恢复/撤销都会重排，存下标会删错照片。
+    selected: HashSet<i64>,
     /// 扫描状态文字
     scan_status: String,
     is_scanning: bool,
@@ -93,6 +97,8 @@ pub struct AppState {
     analyze_rx: Option<Receiver<AnalyzeProgress>>,
     is_analyzing: bool,
     analyze_status: String,
+    /// 扫描完成但分析正忙时排队，避免这次自动分析被静默丢弃。
+    pending_analysis: bool,
     /// 整理页当前打开的工具列表（None 表示工具卡片总览）
     active_tool: Option<OrganizeTool>,
     /// M3 回收站/操作日志快照
@@ -175,6 +181,7 @@ impl AppState {
                 analyze_rx: None,
                 is_analyzing: false,
                 analyze_status: String::new(),
+                pending_analysis: false,
                 active_tool: None,
                 ops_data,
                 ops_status: String::new(),
@@ -197,26 +204,48 @@ impl AppState {
         })
     }
 
-    /// 统一刷新三个数据快照（批量操作后调用）；失败时记录错误态。
+    /// 统一刷新三个数据快照（批量操作后调用）；失败时记录错误态且不吞掉旧快照。
     fn reload_all(&mut self) {
+        // 保留当前目录过滤与关键词：LibraryData::reload 会重置它们，
+        // 不回填会造成「目录树仍高亮旧目录、网格却显示全部照片」。
+        let active_folder = self.data.active_folder.clone();
+        let keyword = self.data.keyword.clone();
+        let active_folder_id = self.active_folder_id.clone();
         match crate::core::db::open(&self.paths.db_path) {
             Ok(conn) => {
-                self.data = LibraryData::reload(&conn).unwrap_or_default();
-                self.analyze_data = AnalyzeData::reload(&conn).unwrap_or_default();
-                self.ops_data = OpsData::reload(&conn).unwrap_or_default();
+                match LibraryData::reload(&conn) {
+                    Ok(mut d) => {
+                        d.active_folder = active_folder;
+                        d.keyword = keyword;
+                        self.data = d;
+                    }
+                    Err(e) => self.last_error = Some(format!("刷新相册库失败：{e}")),
+                }
+                match AnalyzeData::reload(&conn) {
+                    Ok(d) => self.analyze_data = d,
+                    Err(e) => self.last_error = Some(format!("刷新分析结果失败：{e}")),
+                }
+                match OpsData::reload(&conn) {
+                    Ok(d) => self.ops_data = d,
+                    Err(e) => self.last_error = Some(format!("刷新操作记录失败：{e}")),
+                }
+                // 选中的目录若已不存在（例如被归档/清空），清掉高亮避免与网格不符。
+                if let Some(id) = &active_folder_id {
+                    if crate::ui::library::find_folder(&self.data.folders, id).is_none() {
+                        self.active_folder_id = None;
+                        self.data.active_folder = None;
+                    }
+                }
                 self.load_error = None;
             }
             Err(e) => self.load_error = Some(format!("刷新索引失败：{e}")),
         }
+        self.selected.clear();
     }
 
-    /// 当前多选对应的照片 id（按可见列表索引映射）。
+    /// 当前多选对应的照片 id（与列表顺序无关）。
     fn selected_photo_ids(&self) -> Vec<i64> {
-        let visible = self.data.visible_photos();
-        self.selected
-            .iter()
-            .filter_map(|&idx| visible.get(idx).map(|p| p.id))
-            .collect()
+        self.selected.iter().copied().collect()
     }
 
     /// 批量删除选中照片到回收站（同步执行，数量通常不大）。
@@ -300,8 +329,14 @@ impl AppState {
             .map_err(anyhow::Error::from)
             .and_then(|conn| ops_trash::undo_trash(&paths, &conn, op_id));
         match result {
-            Ok(n) => {
+            Ok(n) if n > 0 => {
                 self.ops_status = format!("已撤销删除，恢复 {n} 张");
+                self.last_trash_op = None;
+                self.reload_all();
+            }
+            Ok(_) => {
+                // 清空/清理后仍点撤销时，不能报「恢复 0 张」当作成功。
+                self.ops_status = "没有可恢复的项目（可能已被清空或过期清理）".to_string();
                 self.last_trash_op = None;
                 self.reload_all();
             }
@@ -373,17 +408,24 @@ impl AppState {
         }
     }
 
-    /// 用原生对话框选择归档目标目录。
-    fn choose_archive_dest(&mut self) {
-        if let Some(folder) = rfd::FileDialog::new()
-            .set_title("选择归档目标目录")
-            .pick_folder()
-        {
-            self.archive_dest = folder.to_path_buf();
-            self.persist_archive_settings();
-            self.refresh_archive_plan();
-            self.ops_status = format!("归档目标：{}", self.archive_dest.display());
+    /// 设置归档目标目录（原生对话框在调用方、且在 `update` 之外打开）。
+    /// 目标落在扫描根目录内部会导致归档产物被下次扫描重复索引，直接拒绝。
+    fn set_archive_dest(&mut self, dest: PathBuf) {
+        let roots = crate::core::db::open(&self.paths.db_path)
+            .ok()
+            .and_then(|c| crate::core::db::list_scan_roots(&c).ok())
+            .unwrap_or_default();
+        if let Some(r) = roots.iter().find(|r| dest.starts_with(&r.path)) {
+            let msg = format!("归档目标不能位于扫描目录内：{}", r.path.display());
+            self.ops_status = msg.clone();
+            self.last_error = Some(msg);
+            return;
         }
+        self.archive_dest = dest;
+        self.persist_archive_settings();
+        self.refresh_archive_plan();
+        self.ops_status = format!("归档目标：{}", self.archive_dest.display());
+        self.last_error = None;
     }
 
     /// 执行归档：用刚刷新的计划落盘（保证目录树预览与实际一致）。
@@ -466,38 +508,58 @@ impl AppState {
             }
         });
 
-        // UI 侧：定时轮询进度通道，收到 Finished/Failed 后刷新数据快照
+        // UI 侧：定时轮询进度通道，收到 Finished/Failed 后刷新数据快照。
+        // 关键：每轮必须排空 channel。后台每张照片一条进度时，若每 150ms 只收一条，
+        // 5000 张会把 Finished 挤到 ~12 分钟后，界面永远停在「扫描中…」。
         cx.spawn(async move |entity, app: &mut AsyncApp| {
             loop {
-                // 每 150ms 轮询一次，避免占满 UI 主线程
                 gpui::background_executor()
                     .timer(std::time::Duration::from_millis(150))
                     .await;
 
-                // 从实体里取出 receiver 做一次非阻塞接收
-                let got = entity
+                let messages = match entity
                     .update(app, |this: &mut Self, _cx| {
-                        if let Some(rx) = &this.progress_rx {
+                        let Some(rx) = &this.progress_rx else {
+                            return Vec::new();
+                        };
+                        let mut out = Vec::new();
+                        let mut disconnected = false;
+                        loop {
                             match rx.try_recv() {
-                                Ok(p) => Some(p),
-                                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                                Ok(p) => out.push(p),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    Some(ScanProgress::Failed {
-                                        message: "扫描线程意外退出".to_string(),
-                                    })
+                                    disconnected = true;
+                                    break;
                                 }
                             }
-                        } else {
-                            None
                         }
+                        let has_terminal = out.iter().any(|m| {
+                            matches!(
+                                m,
+                                ScanProgress::Finished { .. } | ScanProgress::Failed { .. }
+                            )
+                        });
+                        if disconnected && !has_terminal {
+                            out.push(ScanProgress::Failed {
+                                message: "扫描线程意外退出".to_string(),
+                            });
+                        }
+                        out
                     })
                     .ok()
-                    .flatten();
+                {
+                    Some(v) => v,
+                    None => break, // entity 已释放，不要空转
+                };
+                if messages.is_empty() {
+                    continue;
+                }
 
-                if let Some(p) = got {
-                    let mut done = false;
-                    entity
-                        .update(app, |this: &mut Self, cx| {
+                let done = entity
+                    .update(app, |this: &mut Self, cx| {
+                        let mut done = false;
+                        for p in messages.iter().cloned() {
                             match p {
                                 ScanProgress::Started { root } => {
                                     this.scan_status = format!("正在扫描 {} …", root.display());
@@ -506,20 +568,24 @@ impl AppState {
                                     this.scan_status = format!("正在扫描 … 已处理 {} 张", processed);
                                 }
                                 ScanProgress::Finished { stats } => {
-                                    if let Ok(conn) = crate::core::db::open(&this.paths.db_path) {
-                                        this.data = LibraryData::reload(&conn).unwrap_or_default();
-                                    }
+                                    this.selected.clear();
+                                    this.reload_all();
                                     this.scan_status = format!(
-                                        "扫描完成：新增 {} 张，跳过 {} 张，清理 {} 张，耗时 {} ms",
-                                        stats.photos_added, stats.photos_skipped,
-                                        stats.photos_removed, stats.duration_ms
+                                        "扫描完成：新增 {} 张，更新 {} 张，跳过 {} 张，清理 {} 张，耗时 {} ms",
+                                        stats.photos_added, stats.photos_updated,
+                                        stats.photos_skipped, stats.photos_removed, stats.duration_ms
                                     );
                                     this.is_scanning = false;
                                     this.progress_rx = None;
                                     this.last_error = None;
                                     done = true;
-                                    // 扫描完成后自动触发 M2 分析
-                                    this.start_analysis(cx);
+                                    // 只有索引真正变化时才重跑分析，避免重复扫描触发 O(n²) 全量重算。
+                                    if stats.photos_added > 0
+                                        || stats.photos_updated > 0
+                                        || stats.photos_removed > 0
+                                    {
+                                        this.start_analysis(cx);
+                                    }
                                 }
                                 ScanProgress::Failed { message } => {
                                     this.scan_status = format!("扫描失败：{message}");
@@ -529,12 +595,14 @@ impl AppState {
                                     done = true;
                                 }
                             }
-                            cx.notify();
-                        })
-                        .ok();
-                    if done {
-                        break;
-                    }
+                        }
+                        cx.notify();
+                        done
+                    })
+                    .ok()
+                    .unwrap_or(true);
+                if done {
+                    break;
                 }
             }
         }).detach();
@@ -544,8 +612,10 @@ impl AppState {
     /// 扫描完成后会自动调用；也可在整理页手动重新分析。
     pub fn start_analysis(&mut self, cx: &mut Context<Self>) {
         if self.is_analyzing {
+            self.pending_analysis = true;
             return;
         }
+        self.pending_analysis = false;
         self.is_analyzing = true;
         self.analyze_status = "正在分析照片 …".to_string();
 
@@ -564,36 +634,57 @@ impl AppState {
             }
         });
 
-        // UI 侧：与扫描一致的定时轮询。
+        // UI 侧：与扫描一致，每轮排空 channel，避免 Finished 被进度消息长期挤在队尾。
         cx.spawn(async move |entity, app: &mut AsyncApp| {
             loop {
                 gpui::background_executor()
                     .timer(std::time::Duration::from_millis(200))
                     .await;
 
-                let got = entity
+                let messages = match entity
                     .update(app, |this: &mut Self, _cx| {
-                        if let Some(rx) = &this.analyze_rx {
+                        let Some(rx) = &this.analyze_rx else {
+                            return Vec::new();
+                        };
+                        let mut out = Vec::new();
+                        let mut disconnected = false;
+                        loop {
                             match rx.try_recv() {
-                                Ok(p) => Some(p),
-                                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                                Ok(p) => out.push(p),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    Some(AnalyzeProgress::Failed {
-                                        message: "分析线程意外退出".to_string(),
-                                    })
+                                    disconnected = true;
+                                    break;
                                 }
                             }
-                        } else {
-                            None
                         }
+                        let has_terminal = out.iter().any(|m| {
+                            matches!(
+                                m,
+                                AnalyzeProgress::Finished { .. }
+                                    | AnalyzeProgress::Failed { .. }
+                            )
+                        });
+                        if disconnected && !has_terminal {
+                            out.push(AnalyzeProgress::Failed {
+                                message: "分析线程意外退出".to_string(),
+                            });
+                        }
+                        out
                     })
                     .ok()
-                    .flatten();
+                {
+                    Some(v) => v,
+                    None => break,
+                };
+                if messages.is_empty() {
+                    continue;
+                }
 
-                if let Some(p) = got {
-                    let mut done = false;
-                    entity
-                        .update(app, |this: &mut Self, cx| {
+                let done = entity
+                    .update(app, |this: &mut Self, cx| {
+                        let mut done = false;
+                        for p in messages.iter().cloned() {
                             match p {
                                 AnalyzeProgress::Started { total } => {
                                     this.analyze_status = format!("正在分析 … 共 {total} 张");
@@ -603,14 +694,13 @@ impl AppState {
                                         format!("正在分析 … {processed}/{total} 张");
                                 }
                                 AnalyzeProgress::Finished { report } => {
-                                    if let Ok(conn) = crate::core::db::open(&this.paths.db_path) {
-                                        this.analyze_data =
-                                            AnalyzeData::reload(&conn).unwrap_or_default();
-                                    }
+                                    // 分析结果会写回 photos，详情弹窗也依赖这些字段，必须整体刷新。
+                                    this.reload_all();
                                     this.analyze_status = format!(
-                                        "分析完成：模糊 {} 张，截图 {} 张，相似组 {} 组，耗时 {} ms",
+                                        "分析完成：模糊 {} 张，截图 {} 张，相似组 {} 组，失败 {} 张，耗时 {} ms",
                                         report.blurry_count, report.screenshot_count,
-                                        report.similar_groups, report.duration_ms
+                                        report.similar_groups, report.photos_failed,
+                                        report.duration_ms
                                     );
                                     this.is_analyzing = false;
                                     this.analyze_rx = None;
@@ -625,12 +715,18 @@ impl AppState {
                                     done = true;
                                 }
                             }
-                            cx.notify();
-                        })
-                        .ok();
-                    if done {
-                        break;
-                    }
+                        }
+                        if done && this.pending_analysis {
+                            this.pending_analysis = false;
+                            this.start_analysis(cx);
+                        }
+                        cx.notify();
+                        done
+                    })
+                    .ok()
+                    .unwrap_or(true);
+                if done {
+                    break;
                 }
             }
         }).detach();
@@ -640,17 +736,77 @@ impl AppState {
 // ===== 根组件 =====
 pub struct AppRoot {
     app: Entity<AppState>,
+    /// 相册库搜索框与重命名前缀输入框（首次 render 时创建，需要 Window 上下文）。
+    search_input: Option<Entity<InputState>>,
+    prefix_input: Option<Entity<InputState>>,
+    /// Subscription 必须持有，drop 即取消订阅。
+    _subscriptions: Vec<gpui::Subscription>,
 }
 
 impl AppRoot {
     pub fn new(app: Entity<AppState>) -> Self {
-        Self { app }
+        Self {
+            app,
+            search_input: None,
+            prefix_input: None,
+            _subscriptions: Vec::new(),
+        }
+    }
+
+    /// 首次渲染时创建输入状态：InputState::new 需要 Window，AppRoot::new 阶段拿不到。
+    /// 输入变化同步到 AppState，保证预览/过滤实时刷新。
+    fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_input.is_some() {
+            return;
+        }
+        let search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("搜索文件名 / 地点 / 标签")
+        });
+        let prefix = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("重命名前缀（可选）")
+        });
+
+        let app_for_search = self.app.clone();
+        let s = search.clone();
+        self._subscriptions.push(cx.subscribe(
+            &search,
+            move |_this, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    let v = s.read(cx).value().to_string();
+                    app_for_search.update(cx, |st, cx| {
+                        st.data.keyword = v;
+                        cx.notify();
+                    });
+                }
+            },
+        ));
+
+        let app_for_prefix = self.app.clone();
+        let p = prefix.clone();
+        self._subscriptions.push(cx.subscribe(
+            &prefix,
+            move |_this, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    let v = p.read(cx).value().to_string();
+                    app_for_prefix.update(cx, |st, cx| {
+                        st.rename_prefix = v;
+                        cx.notify();
+                    });
+                }
+            },
+        ));
+
+        self.search_input = Some(search);
+        self.prefix_input = Some(prefix);
     }
 }
 
 impl Render for AppRoot {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_inputs(window, cx);
         let state = self.app.read(cx);
+        let search_input = self.search_input.clone();
+        let prefix_input = self.prefix_input.clone();
 
         let titlebar = div()
             .id("titlebar")
@@ -694,6 +850,24 @@ impl Render for AppRoot {
             );
 
         let sidebar = self.sidebar(state);
+        // 全局错误横幅：索引/后台任务失败时，任意页面都能看到，而不是只在首页/设置页。
+        let error_banner: AnyElement = if let Some(err) =
+            state.load_error.as_ref().or(state.last_error.as_ref())
+        {
+            div()
+                .id("global-error-banner")
+                .mb(px(12.))
+                .px(px(14.))
+                .py(px(10.))
+                .rounded_md()
+                .bg(rgba(0xE0, 0x54, 0x4C, 0.10))
+                .text_size(px(12.))
+                .text_color(col(DANGER))
+                .child(format!("⚠ {err}"))
+                .into_any_element()
+        } else {
+            div().id("global-error-none").into_any_element()
+        };
         let content = div()
             .id("content")
             .flex_1()
@@ -702,7 +876,8 @@ impl Render for AppRoot {
             .px(px(24.))
             .py(px(20.))
             .overflow_y_scroll()
-            .child(self.render_page(state));
+            .child(error_banner)
+            .child(self.render_page(state, search_input, prefix_input));
 
         div()
             .id("window")
@@ -809,11 +984,14 @@ impl AppRoot {
                     ])
                 })
                 .on_click(move |_ev, _w, cx| {
-                    let s = app.update(cx, |s, cx| {
+                    let _ = app.update(cx, |s, cx| {
                         s.page = page;
+                        // 进入归档页时重算预览：扫描新增照片或改变选中后，旧计划会过期。
+                        if matches!(page, Page::Archive) {
+                            s.refresh_archive_plan();
+                        }
                         cx.notify();
                     });
-                    let _ = s;
                 });
             btn.into_any_element()
         };
@@ -874,12 +1052,17 @@ impl AppRoot {
             )
     }
 
-    fn render_page(&self, state: &AppState) -> impl IntoElement + 'static {
+    fn render_page(
+        &self,
+        state: &AppState,
+        search_input: Option<Entity<InputState>>,
+        prefix_input: Option<Entity<InputState>>,
+    ) -> impl IntoElement + 'static {
         match state.page {
             Page::Home => self.page_home(state).into_any_element(),
             Page::Organize => self.page_organize(state).into_any_element(),
-            Page::Library => self.page_library(state).into_any_element(),
-            Page::Rename => self.page_rename(state).into_any_element(),
+            Page::Library => self.page_library(state, search_input).into_any_element(),
+            Page::Rename => self.page_rename(state, prefix_input).into_any_element(),
             Page::Archive => self.page_archive(state).into_any_element(),
             Page::Trash => self.page_trash(state).into_any_element(),
             Page::Settings => self.page_settings(state).into_any_element(),
@@ -928,22 +1111,9 @@ impl AppRoot {
                 )
         });
 
-        // 状态横幅：错误态 > 加载态 > 隐藏
-        let banner: AnyElement = if let Some(err) =
-            state.load_error.as_ref().or(state.last_error.as_ref())
-        {
-            div()
-                .id("home-banner")
-                .mb(px(14.))
-                .px(px(14.))
-                .py(px(10.))
-                .rounded_md()
-                .bg(rgba(0xE0, 0x54, 0x4C, 0.10))
-                .text_size(px(12.))
-                .text_color(col(DANGER))
-                .child(format!("⚠ {err}"))
-                .into_any_element()
-        } else if state.is_scanning || state.is_analyzing {
+        // 错误态由 AppRoot 的全局横幅统一展示，这里只保留后台任务进度。
+        // 扫描优先于分析，避免先分析过一次后就永远看不到扫描进度。
+        let banner: AnyElement = if state.is_scanning || state.is_analyzing {
             let text = if state.is_scanning {
                 state.scan_status.clone()
             } else {
@@ -1111,10 +1281,19 @@ impl AppRoot {
             .icon(IconName::FolderOpen)
             .label("选择目录")
             .on_click(move |_ev, _w, cx| {
-                app3.update(cx, |s, cx| {
-                    s.page = Page::Library;
-                    cx.notify();
-                });
+                // 与相册库工具栏一致：直接弹原生目录对话框并建立索引，
+                // 而不是只跳页让用户再找一次按钮。
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("选择照片目录")
+                    .pick_folder()
+                {
+                    let path = folder.to_path_buf();
+                    app3.update(cx, |s, cx| {
+                        s.page = Page::Library;
+                        s.start_scan(path, cx);
+                        cx.notify();
+                    });
+                }
             });
 
         div()
@@ -1531,8 +1710,19 @@ impl AppRoot {
     }
 
     // ===== 相册库页 =====
-    fn page_library(&self, state: &AppState) -> impl IntoElement + 'static {
+    fn page_library(&self, state: &AppState, search_input: Option<Entity<InputState>>) -> impl IntoElement + 'static {
         let app = &self.app;
+
+        // 搜索框：输入变化由 AppRoot 的订阅同步到 data.keyword，过滤即时生效。
+        let search_box: AnyElement = match search_input {
+            Some(st) => div()
+                .id("grid-search")
+                .w(px(230.))
+                .flex_none()
+                .child(Input::new(&st))
+                .into_any_element(),
+            None => div().id("grid-search-none").into_any_element(),
+        };
 
         // 目录树面板（真实数据）
         let tree_panel = div()
@@ -1599,7 +1789,8 @@ impl AppRoot {
                         for column in 0..GRID_COLUMNS {
                             let idx = row * GRID_COLUMNS + column;
                             let Some(photo) = photos.get(idx) else { break };
-                            let is_selected = selected.contains(&idx);
+                            let photo_id = photo.id;
+                            let is_selected = selected.contains(&photo_id);
                             let location = photo.location.clone().unwrap_or_default();
                             let dialog_photo = photo.clone();
                             let tile_app = app_for_list.clone();
@@ -1631,10 +1822,8 @@ impl AppRoot {
                                 .on_click(move |ev, window, cx| {
                                     if ev.modifiers().control || ev.modifiers().platform {
                                         tile_app.update(cx, |s, cx| {
-                                            if s.selected.contains(&idx) {
-                                                s.selected.remove(&idx);
-                                            } else {
-                                                s.selected.insert(idx);
+                                            if !s.selected.insert(photo_id) {
+                                                s.selected.remove(&photo_id);
                                             }
                                             cx.notify();
                                         });
@@ -1689,6 +1878,7 @@ impl AppRoot {
                             )
                             .child(" 张照片"),
                     )
+                    .child(search_box)
                     .child(
                         div()
                             .id("grid-selectinfo")
@@ -1736,6 +1926,7 @@ impl AppRoot {
                     let path = folder.to_path_buf();
                     app_for_scan.update(cx, |s, cx| {
                         s.start_scan(path, cx);
+                        cx.notify();
                     });
                 }
             });
@@ -1760,7 +1951,10 @@ impl AppRoot {
             .label(if has_selection { "删除到回收站" } else { "删除" })
             .text_color(col(if has_selection { DANGER } else { TEXT_SECONDARY }))
             .on_click(move |_ev, _w, cx| {
-                app_del.update(cx, |s, _cx| s.batch_trash());
+                app_del.update(cx, |s, cx| {
+                    s.batch_trash();
+                    cx.notify();
+                });
             });
 
         // 批量操作状态提示（删除/重命名/撤销结果）
@@ -1813,10 +2007,21 @@ impl AppRoot {
     }
 
     // ===== 重命名页（M3） =====
-    fn page_rename(&self, state: &AppState) -> impl IntoElement + 'static {
+    fn page_rename(&self, state: &AppState, prefix_input: Option<Entity<InputState>>) -> impl IntoElement + 'static {
         let app = &self.app;
         let ids = state.selected_photo_ids();
         let count = ids.len();
+
+        // 前缀输入框：让 `{前缀}` 占位符真正生效（此前字段永远为空，示例名无法复现）。
+        let prefix_box: AnyElement = match prefix_input {
+            Some(st) => div()
+                .id("rename-prefix-input")
+                .w(px(260.))
+                .flex_none()
+                .child(Input::new(&st))
+                .into_any_element(),
+            None => div().id("rename-prefix-input-none").into_any_element(),
+        };
 
         // 预设模板（点击即选用，避免文本输入框在 dialog 中的 window 生命周期复杂度）
         let presets: Vec<(&str, &str, &str)> = vec![
@@ -1897,16 +2102,24 @@ impl AppRoot {
             .primary()
             .icon(IconName::CaseSensitive)
             .label(format!("执行重命名（{} 张）", count))
+            .disabled(count == 0)
             .on_click(move |_ev, _w, cx| {
-                app_exec.update(cx, |s, _cx| s.batch_rename());
+                app_exec.update(cx, |s, cx| {
+                    s.batch_rename();
+                    cx.notify();
+                });
             });
         let app_undo = app.clone();
         let undo_btn = Button::new("rename-undo")
             .outline()
             .icon(IconName::Undo)
             .label("撤销上次重命名")
+            .disabled(state.last_rename_op.is_none())
             .on_click(move |_ev, _w, cx| {
-                app_undo.update(cx, |s, _cx| s.undo_rename());
+                app_undo.update(cx, |s, cx| {
+                    s.undo_rename();
+                    cx.notify();
+                });
             });
 
         let status = if state.ops_status.is_empty() {
@@ -1921,6 +2134,14 @@ impl AppRoot {
             .child(page_title("✏️ 批量重命名", "选择命名模板，预览后执行 · 可一次撤销"))
             .child(div().id("rename-status").text_size(px(12.)).text_color(col(TEXT_SECONDARY))
                 .my(px(10.)).child(status))
+            .child(
+                div()
+                    .id("rename-prefix-row")
+                    .flex().flex_row().items_center().gap(px(10.))
+                    .mb(px(12.))
+                    .child(div().text_size(px(12.)).text_color(col(TEXT_SECONDARY)).child("前缀："))
+                    .child(prefix_box),
+            )
             .child(div().id("rename-presets").flex().flex_row().gap(px(10.)).mb(px(16.)).children(preset_cards))
             .child(
                 div().id("rename-preview-panel").flex_1().bg(col(BG_WHITE)).rounded_lg()
@@ -2064,10 +2285,16 @@ impl AppRoot {
             .icon(IconName::FolderOpen)
             .label("选择归档目标目录")
             .on_click(move |_ev, _w, cx| {
-                app_dest.update(cx, |s, cx| {
-                    s.choose_archive_dest();
-                    cx.notify();
-                });
+                // 模态对话框在实体 update 之外打开，避免对话框消息泵重入借用。
+                let picked = rfd::FileDialog::new()
+                    .set_title("选择归档目标目录")
+                    .pick_folder();
+                if let Some(folder) = picked {
+                    app_dest.update(cx, |s, cx| {
+                        s.set_archive_dest(folder.to_path_buf());
+                        cx.notify();
+                    });
+                }
             });
 
         // 完整目录树预览：展平成 (深度, 节点) 列表，缩进体现层级
@@ -2218,6 +2445,7 @@ impl AppRoot {
             .outline()
             .icon(IconName::Undo)
             .label("撤销上次归档")
+            .disabled(state.last_archive_op.is_none())
             .on_click(move |_ev, _w, cx| {
                 app_undo.update(cx, |s, cx| {
                     s.undo_archive();
@@ -2229,6 +2457,7 @@ impl AppRoot {
             .primary()
             .icon(IconName::FolderOpen)
             .label(format!("执行归档（{} 张）", total_files))
+            .disabled(total_files == 0)
             .on_click(move |_ev, _w, cx| {
                 app_exec.update(cx, |s, cx| {
                     s.execute_archive();
@@ -2335,23 +2564,8 @@ impl AppRoot {
                 .into_any_element()
         };
 
-        // 错误态横幅：索引库或后台任务失败时给出可读提示
-        let banner: AnyElement = if let Some(err) =
-            state.load_error.as_ref().or(state.last_error.as_ref())
-        {
-            div()
-                .id("settings-banner")
-                .px(px(14.))
-                .py(px(10.))
-                .rounded_md()
-                .bg(rgba(0xE0, 0x54, 0x4C, 0.10))
-                .text_size(px(12.))
-                .text_color(col(DANGER))
-                .child(format!("⚠ {err}"))
-                .into_any_element()
-        } else {
-            div().id("settings-banner-none").into_any_element()
-        };
+        // 错误态统一由 AppRoot 的全局横幅展示，避免只在部分页面可见。
+        let banner: AnyElement = div().id("settings-banner-none").into_any_element();
 
         // 1) 本机数据路径（全部来自 Paths，非硬编码）
         let paths_for_btn = paths.clone();
@@ -2536,7 +2750,9 @@ impl AppRoot {
                 // 原图已移动到回收站目录，重定向到真实存在的文件，保证大图/按钮可用
                 let mut thumb_photo = item.photo.clone();
                 thumb_photo.path = item.trash_path.clone();
-                let age_days = (crate::core::db::now_millis() - item.trashed_at) / (24 * 60 * 60 * 1000);
+                let age_days = (crate::core::db::now_millis() - item.trashed_at)
+                    .max(0)
+                    / (24 * 60 * 60 * 1000);
                 div()
                     .id(("trash-row", i))
                     .flex().flex_row().items_center().gap(px(12.))
@@ -2591,7 +2807,11 @@ impl AppRoot {
                         .map_err(anyhow::Error::from)
                         .and_then(|conn| ops_trash::empty_trash(&paths, &conn));
                     match result {
-                        Ok(n) => s.ops_status = format!("已永久清空回收站 {} 张", n),
+                        Ok(n) => {
+                            s.ops_status = format!("已永久清空回收站 {} 张", n);
+                            // 文件已永久删除，原来的「撤销上次删除」不再有效。
+                            s.last_trash_op = None;
+                        }
                         Err(e) => s.ops_status = format!("清空失败：{e}"),
                     }
                     s.reload_all();
@@ -2608,7 +2828,10 @@ impl AppRoot {
                         .map_err(anyhow::Error::from)
                         .and_then(|conn| ops_trash::purge_expired(&conn, days));
                     match result {
-                        Ok(n) => s.ops_status = format!("已清理 {} 天前项目 {} 张", days, n),
+                        Ok(n) => {
+                            s.ops_status = format!("已清理 {} 天前项目 {} 张", days, n);
+                            s.last_trash_op = None;
+                        }
                         Err(e) => s.ops_status = format!("清理失败：{e}"),
                     }
                     s.reload_all();
@@ -2617,7 +2840,13 @@ impl AppRoot {
             });
         let app_undo = app.clone();
         let undo_btn = Button::new("trash-undo").ghost().icon(IconName::Undo).label("撤销上次删除")
-            .on_click(move |_ev, _w, cx| app_undo.update(cx, |s, _cx| s.undo_trash()));
+            .disabled(state.last_trash_op.is_none())
+            .on_click(move |_ev, _w, cx| {
+                app_undo.update(cx, |s, cx| {
+                    s.undo_trash();
+                    cx.notify();
+                });
+            });
 
         let status = if state.ops_status.is_empty() {
             format!("回收站中的文件保留 {} 天，之后可手动清理；恢复会放回原路径。当前 {} 张 · {}", state.retention_days, ops.trash_count, ops.size_label())
@@ -2841,12 +3070,16 @@ fn is_decodable_image(path: &std::path::Path) -> bool {
 
 /// 网格/列表缩略图源：优先缩略图缓存；缓存缺失时回退到原图（仅可解码格式）。
 fn thumbnail_source(photo: &Photo) -> Option<PathBuf> {
+    // 原图已被外部移动/删除时，不再拿旧缓存冒充有效照片，避免显示「幽灵缩略图」。
+    if !photo.path.exists() {
+        return None;
+    }
     if let Some(t) = &photo.thumbnail_path {
         if t.exists() {
             return Some(t.clone());
         }
     }
-    if photo.path.exists() && is_decodable_image(&photo.path) {
+    if is_decodable_image(&photo.path) {
         return Some(photo.path.clone());
     }
     None
@@ -3030,6 +3263,8 @@ fn open_photo_dialog(photo: Photo, window: &mut Window, cx: &mut App) {
 
     let open_path = photo.path.clone();
     let reveal_path = photo.path.clone();
+    // 文件被移动/删除后按钮不能「点了没反应」：直接禁用并改文案。
+    let original_exists = photo.path.exists();
 
     // 大图元素工厂：dialog 每次重绘都会调用，因此必须是可重复调用的 Fn。
     let make_big = {
@@ -3074,11 +3309,21 @@ fn open_photo_dialog(photo: Photo, window: &mut Window, cx: &mut App) {
         };
 
         let p_open = open_path.clone();
-        let open_btn = dialog_btn(IconName::Frame, "打开原图", PRIMARY)
-            .on_click(move |_ev, _w, _cx| open_with_default(&p_open));
+        let open_btn = dialog_btn(
+            IconName::Frame,
+            if original_exists { "打开原图" } else { "原图已移动" },
+            PRIMARY,
+        )
+        .disabled(!original_exists)
+        .on_click(move |_ev, _w, _cx| open_with_default(&p_open));
         let p_reveal = reveal_path.clone();
-        let reveal_btn = dialog_btn(IconName::FolderOpen, "所在文件夹", TEXT_SECONDARY)
-            .on_click(move |_ev, _w, _cx| reveal_in_explorer(&p_reveal));
+        let reveal_btn = dialog_btn(
+            IconName::FolderOpen,
+            if original_exists { "所在文件夹" } else { "原路径不可用" },
+            TEXT_SECONDARY,
+        )
+        .disabled(!original_exists)
+        .on_click(move |_ev, _w, _cx| reveal_in_explorer(&p_reveal));
 
         dialog
             .title(format!("照片详情 · {}", name))

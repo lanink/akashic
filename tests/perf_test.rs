@@ -46,7 +46,8 @@ fn bench_5000_photos() {
     let count: usize = std::env::var("AKASHIC_BENCH_COUNT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(PHOTO_COUNT);
+        .unwrap_or(PHOTO_COUNT)
+        .max(1); // 0 会导致除零与空目录树断言失败
 
     let base = temp_dir("5000");
     let photos_dir = base.join("photos");

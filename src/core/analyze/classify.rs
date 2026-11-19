@@ -18,13 +18,22 @@ const STRONG_NAME_MARKERS: &[&str] = &[
 const WEAK_NAME_MARKERS: &[&str] = &["screen", "capture", "snap", "shot"];
 
 /// 常见手机/屏幕的宽高比（高/宽 或 宽/高），用于辅助判断截图。
+/// 刻意不含 4:3 / 3:4 —— 那是普通相机最常见的比例，把它当截图证据会误判相机照片。
 const SCREEN_RATIOS: &[f64] = &[
     16.0 / 9.0,   // 横屏
     9.0 / 16.0,   // 竖屏
     19.5 / 9.0,   // 全面屏
     9.0 / 19.5,
-    4.0 / 3.0,
-    3.0 / 4.0,
+    20.0 / 9.0,
+    9.0 / 20.0,
+];
+
+/// 精确屏幕分辨率（宽×高）。相机不会输出这些尺寸，是「无 EXIF 截图」最强的证据。
+const SCREEN_SIZES: &[(i32, i32)] = &[
+    (1080, 1920), (1920, 1080), (1170, 2532), (1284, 2778),
+    (1440, 3200), (1080, 2400), (750, 1334), (1242, 2208),
+    (2560, 1440), (1125, 2436), (828, 1792), (1242, 2688),
+    (1536, 2048), (1440, 2560),
 ];
 
 /// 计算一张照片是截图的可能性（0..100）。
@@ -46,12 +55,21 @@ pub fn screenshot_likelihood(photo: &Photo) -> u32 {
         score += 20;
     }
 
-    // 宽高比接近常见屏幕比例
+    // 宽高比接近常见屏幕比例（不含相机常用的 4:3）
     if photo.width > 0 && photo.height > 0 {
         let ratio = photo.height as f64 / photo.width as f64;
         if SCREEN_RATIOS.iter().any(|r| (ratio - r).abs() < 0.03) {
             score += 15;
         }
+    }
+
+    // 精确匹配屏幕分辨率：让「无关键词、无 EXIF」的真实截图也能过阈值，
+    // 而不必把「无 EXIF」单独加权到会误判所有网络图的程度。
+    if SCREEN_SIZES.iter().any(|(w, h)| {
+        (photo.width == *w && photo.height == *h)
+            || (photo.width == *h && photo.height == *w)
+    }) {
+        score += 30;
     }
 
     // 标签命中
@@ -134,6 +152,25 @@ mod tests {
         let p = photo("screen_capture.png", Some("SomeCam"), 777, 531, 1000);
         assert_eq!(screenshot_likelihood(&p), 35);
         assert!(!is_screenshot(&p));
+    }
+
+    /// 回归：4:3 是普通相机最常见比例，不能被当作截图证据。
+    /// 修复前 4:3/3:4 在 SCREEN_RATIOS 中，会让「弱关键词 + 有 EXIF 设备」的
+    /// 相机照凑满 50 分被误判成截图。
+    #[test]
+    fn four_three_ratio_is_not_screenshot_evidence() {
+        let p = photo("screen_capture.png", Some("Canon EOS"), 4000, 3000, 3_000_000);
+        assert_eq!(screenshot_likelihood(&p), 35);
+        assert!(!is_screenshot(&p));
+    }
+
+    /// 回归：真实截图常无关键词，但尺寸精确等于屏幕分辨率，应能过阈值。
+    /// 修复前只有「无 EXIF 20 + 屏幕比例 15 = 35」，必然漏判。
+    #[test]
+    fn exact_screen_size_without_keywords_is_screenshot() {
+        let p = photo("IMG_9999.png", None, 1080, 1920, 500_000);
+        assert!(screenshot_likelihood(&p) >= SCREENSHOT_THRESHOLD);
+        assert!(is_screenshot(&p));
     }
 
     #[test]

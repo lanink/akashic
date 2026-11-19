@@ -51,18 +51,23 @@ fn analysis_source(photo: &Photo) -> PathBuf {
     photo.path.clone()
 }
 
+/// 进度节流：每处理 N 张上报一次，避免 5000 张产生 5000 条消息把 Finished 挤到队尾。
+const PROGRESS_EVERY: usize = 32;
+
 /// 对单张照片执行全部分析（模糊评分 + 截图识别 + pHash）。
-pub fn analyze_photo(photo: &Photo) -> PhotoAnalysis {
+/// 解码失败返回 `None`：绝不能写成 `blur_score = 0.0`，否则坏图会被当成
+/// 「已分析」且永远排在模糊列表最前面，还会污染 `count_analyzed` / `is_ready()`。
+pub fn analyze_photo(photo: &Photo) -> Option<PhotoAnalysis> {
     let source = analysis_source(photo);
-    let blur_score = blur::blur_score(&source).unwrap_or(0.0);
+    let blur_score = blur::blur_score(&source).ok()?;
     let is_screenshot = classify::is_screenshot(photo);
     let phash = similarity::phash_from_path(&source).ok();
-    PhotoAnalysis {
+    Some(PhotoAnalysis {
         photo_id: photo.id,
         blur_score,
         is_screenshot,
         phash,
-    }
+    })
 }
 
 /// 分析整个索引库，写回分析结果并生成相似分组。
@@ -83,34 +88,37 @@ pub fn analyze_library(
 
     let mut report = AnalyzeReport::default();
     let mut analyses: Vec<PhotoAnalysis> = Vec::with_capacity(total);
+    let mut processed = 0usize;
 
     for photo in &photos {
-        let a = analyze_photo(photo);
-        match db::update_analysis(
-            conn,
-            a.photo_id,
-            a.blur_score,
-            a.is_screenshot,
-            a.phash,
-        ) {
-            Ok(()) => {
-                report.photos_analyzed += 1;
-                if blur::is_blurry(a.blur_score) {
-                    report.blurry_count += 1;
+        match analyze_photo(photo) {
+            None => report.photos_failed += 1, // 解码/评分失败，保留原有 NULL 便于下次重试
+            Some(a) => match db::update_analysis(
+                conn,
+                a.photo_id,
+                a.blur_score,
+                a.is_screenshot,
+                a.phash,
+            ) {
+                Ok(()) => {
+                    report.photos_analyzed += 1;
+                    if blur::is_blurry(a.blur_score) {
+                        report.blurry_count += 1;
+                    }
+                    if a.is_screenshot {
+                        report.screenshot_count += 1;
+                    }
+                    analyses.push(a);
                 }
-                if a.is_screenshot {
-                    report.screenshot_count += 1;
-                }
-                analyses.push(a);
-            }
-            Err(_) => report.photos_failed += 1,
+                Err(_) => report.photos_failed += 1,
+            },
         }
 
+        processed += 1;
         if let Some(tx) = progress {
-            let _ = tx.send(AnalyzeProgress::Analyzing {
-                processed: report.photos_analyzed + report.photos_failed,
-                total,
-            });
+            if processed == 1 || processed % PROGRESS_EVERY == 0 {
+                let _ = tx.send(AnalyzeProgress::Analyzing { processed, total });
+            }
         }
     }
 
@@ -129,7 +137,8 @@ pub fn analyze_library(
         final_groups.extend(refined);
     }
     report.similar_groups = final_groups.len();
-    db::save_similar_groups(conn, &final_groups, started.elapsed().as_millis() as i64)?;
+    // created_at 是时间戳，不是本次分析耗时。
+    db::save_similar_groups(conn, &final_groups, db::now_millis())?;
 
     report.duration_ms = started.elapsed().as_millis();
 
@@ -161,7 +170,7 @@ fn refine_group(group: &[i64], paths: &std::collections::HashMap<i64, PathBuf>) 
             .filter(|p| p.exists())
             .and_then(|p| similarity::dssim_distance(anchor, p).ok())
             .map(|d| d <= similarity::DSSIM_THRESHOLD)
-            .unwrap_or(true); // 精排失败不剔除
+            .unwrap_or(false); // 精排失败不并入核心组，避免坏图被无条件判为相似
         if similar {
             close.push(id);
         } else {

@@ -159,20 +159,17 @@ pub struct ArchiveResult {
     pub dest_root: PathBuf,
 }
 
-/// 从拍摄时间派生 (年, 年-月)；缺失时用「未知日期」兜底。
+/// 从拍摄时间派生 (年, 年-月)；缺失或格式异常时用「未知日期 / 未知月份」兜底。
+/// 只接受标准 `YYYY-MM-DD ...`，避免异常 EXIF 值被字节切片成中文目录名。
 fn date_parts(photo: &Photo) -> (String, String) {
-    match &photo.date_taken {
-        Some(s) if s.len() >= 7 => {
-            let year = s.get(..4).unwrap_or("未知日期").to_string();
-            let ym = s.get(..7).unwrap_or(&year).to_string();
-            (year, ym)
+    if let Some(s) = &photo.date_taken {
+        if let Some(part) = s.get(..10) {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(part, "%Y-%m-%d") {
+                return (d.format("%Y").to_string(), d.format("%Y-%m").to_string());
+            }
         }
-        Some(s) if s.len() >= 4 => {
-            let year = s.get(..4).unwrap_or("未知日期").to_string();
-            (year.clone(), format!("{}_未知月", year))
-        }
-        _ => ("未知日期".to_string(), "未知日期".to_string()),
     }
+    ("未知日期".to_string(), "未知月份".to_string())
 }
 
 /// 故事名：地点 → 第一个标签 → 「未命名故事」。
@@ -311,11 +308,29 @@ pub fn plan(
     let mut total_bytes = 0i64;
     let mut conflict_count = 0usize;
 
+    if !dest_root.is_absolute() {
+        anyhow::bail!("归档目标目录必须是绝对路径: {}", dest_root.display());
+    }
+
     for &id in photo_ids {
         let photo = match db::get_photo_by_id(conn, id)? {
             Some(p) => p,
             None => continue,
         };
+        // Copy 模式会把副本写进主索引；若不排除，下一次归档会把副本再复制一遍，无限增殖。
+        if photo.path.starts_with(dest_root) {
+            continue;
+        }
+        // 目标落在照片所在目录内部时，归档产物会被下次扫描反复索引/反复归档。
+        if let Some(parent) = photo.path.parent() {
+            if dest_root.starts_with(parent) {
+                anyhow::bail!(
+                    "归档目标目录不能位于照片目录内部（{} 位于 {} 下）",
+                    dest_root.display(),
+                    parent.display()
+                );
+            }
+        }
         let comps = dest_components(rule, &photo);
         let dir = comps
             .iter()
@@ -369,18 +384,9 @@ pub fn execute(conn: &Connection, plan: &ArchivePlan) -> Result<ArchiveResult> {
     let mut done: Vec<(&ArchiveItem, PathBuf)> = Vec::new();
     let file_result = (|| -> Result<()> {
         for item in &plan.items {
-            // 防御：预览之后目标被外部占用时再加后缀，绝不覆盖现有文件。
-            let dst = if item.to_path.exists() {
-                let parent = item.to_path.parent().unwrap_or(Path::new("."));
-                let name = item
-                    .to_path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                unique_dest(parent, &name)
-            } else {
-                item.to_path.clone()
-            };
+            // 严格使用预览阶段算好的目标路径：目标被外部占用时直接失败并回滚，
+            // 不再静默加后缀，保证「目录树预览」与「实际落盘」始终一致。
+            let dst = item.to_path.clone();
             match plan.mode {
                 ArchiveMode::Move => move_file(&item.from_path, &dst)?,
                 ArchiveMode::Copy => {
@@ -413,40 +419,64 @@ pub fn execute(conn: &Connection, plan: &ArchivePlan) -> Result<ArchiveResult> {
         return Err(e).context("归档文件失败（已尝试回滚）");
     }
 
-    // 阶段二：写库（事务）
+    // 阶段二：写库（事务）。失败时把阶段一已落盘的文件全部还原，
+    // 否则会出现「文件已移动/复制但没有索引、没有撤销日志」的孤儿文件。
     let now = db::now_millis();
     let tx = conn.unchecked_transaction().context("开启归档事务失败")?;
-    let detail = format!(
-        "归档 {} 张 · {} · {} → {}",
-        done.len(),
-        plan.rule.label(),
-        plan.mode.label(),
-        plan.dest_root.display()
-    );
-    let op_id = db::insert_op_log(&tx, &kind, now, done.len(), &detail)?;
+    let write_result = (|| -> Result<i64> {
+        let detail = format!(
+            "归档 {} 张 · {} · {} → {}",
+            done.len(),
+            plan.rule.label(),
+            plan.mode.label(),
+            plan.dest_root.display()
+        );
+        let op_id = db::insert_op_log(&tx, &kind, now, done.len(), &detail)?;
 
-    for (item, dst) in &done {
-        let name = dst
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        db::insert_op_entry(&tx, op_id, &item.from_path, dst)?;
-        match plan.mode {
-            ArchiveMode::Move => {
-                db::rename_photo_path(&tx, item.photo_id, dst, &name)?;
-            }
-            ArchiveMode::Copy => {
-                // 副本也进入索引，便于在相册库看到归档结果；源文件索引保持不变。
-                if let Some(mut photo) = db::get_photo_by_id(&tx, item.photo_id)? {
-                    photo.id = 0;
-                    photo.path = dst.clone();
-                    photo.file_name = name;
-                    db::restore_photo(&tx, &photo, None)?;
+        for (item, dst) in &done {
+            let name = dst
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            db::insert_op_entry(&tx, op_id, &item.from_path, dst)?;
+            match plan.mode {
+                ArchiveMode::Move => {
+                    db::rename_photo_path(&tx, item.photo_id, dst, &name)?;
+                }
+                ArchiveMode::Copy => {
+                    // 副本也进入索引，便于在相册库看到归档结果；源文件索引保持不变。
+                    if let Some(mut photo) = db::get_photo_by_id(&tx, item.photo_id)? {
+                        photo.id = 0;
+                        photo.path = dst.clone();
+                        photo.file_name = name;
+                        db::restore_photo(&tx, &photo, None)?;
+                    }
                 }
             }
         }
-    }
-    tx.commit().context("提交归档事务失败")?;
+        Ok(op_id)
+    })();
+    let db_result = match write_result {
+        Ok(op_id) => tx.commit().context("提交归档事务失败").map(|_| op_id),
+        Err(e) => Err(e),
+    };
+
+    let op_id = match db_result {
+        Ok(id) => id,
+        Err(e) => {
+            for (item, dst) in done.iter().rev() {
+                match plan.mode {
+                    ArchiveMode::Move => {
+                        let _ = move_file(dst, &item.from_path);
+                    }
+                    ArchiveMode::Copy => {
+                        let _ = std::fs::remove_file(dst);
+                    }
+                }
+            }
+            return Err(e).context("写索引失败（已尝试还原归档文件）");
+        }
+    };
 
     Ok(ArchiveResult {
         count: done.len(),
@@ -497,37 +527,60 @@ pub fn undo(conn: &Connection, op_id: i64) -> Result<usize> {
             }
 
             let tx = conn.unchecked_transaction().context("开启撤销归档事务失败")?;
-            for (entry, dest) in &moved {
-                let name = dest
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if let Some(photo) = db::get_photo_by_path(&tx, &entry.new_path)? {
-                    db::rename_photo_path(&tx, photo.id, dest, &name)?;
+            let write_result = (|| -> Result<()> {
+                for (entry, dest) in &moved {
+                    let name = dest
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if let Some(photo) = db::get_photo_by_path(&tx, &entry.new_path)? {
+                        db::rename_photo_path(&tx, photo.id, dest, &name)?;
+                    }
                 }
+                db::delete_op(&tx, op_id)?;
+                Ok(())
+            })();
+            let db_result = match write_result {
+                Ok(()) => tx.commit().context("提交撤销归档事务失败"),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = db_result {
+                for (entry, dest) in moved.iter().rev() {
+                    let _ = move_file(dest, &entry.new_path);
+                }
+                return Err(e).context("写索引失败（已尝试把文件移回归档位置）");
             }
-            db::delete_op(&tx, op_id)?;
-            tx.commit().context("提交撤销归档事务失败")?;
             Ok(moved.len())
         }
         OpKind::ArchiveCopy => {
             let tx = conn.unchecked_transaction().context("开启撤销归档事务失败")?;
-            let mut removed = 0usize;
+            let mut to_delete: Vec<PathBuf> = Vec::new();
             for entry in &entries {
                 // 只删除归档副本，绝不触碰源文件（new_path 必须不同于 old_path）。
                 if entry.new_path == entry.old_path {
                     continue;
                 }
-                if entry.new_path.exists() {
-                    std::fs::remove_file(&entry.new_path).with_context(|| {
-                        format!("删除归档副本失败: {}", entry.new_path.display())
-                    })?;
-                }
                 db::delete_photo_by_path(&tx, &entry.new_path)?;
-                removed += 1;
+                to_delete.push(entry.new_path.clone());
             }
             db::delete_op(&tx, op_id)?;
             tx.commit().context("提交撤销归档事务失败")?;
+
+            // DB 提交成功后才永久删除副本：事务回滚时不会删掉任何文件。
+            let mut removed = 0usize;
+            for p in &to_delete {
+                if !p.exists() {
+                    removed += 1;
+                    continue;
+                }
+                match std::fs::remove_file(p) {
+                    Ok(()) => removed += 1,
+                    Err(e) => eprintln!(
+                        "[akashic] 归档副本删除失败 {}: {e}",
+                        p.display()
+                    ),
+                }
+            }
             Ok(removed)
         }
         _ => Ok(0),

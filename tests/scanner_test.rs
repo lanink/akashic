@@ -95,3 +95,109 @@ fn thumbnails_are_reused() {
 
     fs::remove_dir_all(&base).unwrap();
 }
+
+/// 回归：目录名里的 `_` / `%` 是 LIKE 通配符，未转义会越界匹配到别的目录。
+#[test]
+fn like_wildcards_in_directory_name_are_escaped() {
+    let base = temp_dir("like");
+    let photos = base.join("photos");
+    let a = photos.join("2024_旅行");
+    let b = photos.join("2024X旅行");
+    let c = photos.join("100%真实");
+    let d = photos.join("100ABC真实");
+    make_jpeg(&a.join("a.jpg"), 1, 2, 3);
+    make_jpeg(&b.join("b.jpg"), 4, 5, 6);
+    make_jpeg(&c.join("c.jpg"), 7, 8, 9);
+    make_jpeg(&d.join("d.jpg"), 10, 11, 12);
+
+    let paths = Paths::from_app_dir(base.join("appdata"));
+    paths.ensure_dirs().unwrap();
+    let conn = db::open(&paths.db_path).unwrap();
+    scanner::scan_root(&paths, &conn, &photos, None).unwrap();
+    assert_eq!(db::count_photos(&conn).unwrap(), 4);
+
+    let under = db::list_photos_under(&conn, &a).unwrap();
+    assert_eq!(under.len(), 1, "目录名里的 _ 不得被 LIKE 当通配符");
+    assert_eq!(under[0].file_name, "a.jpg");
+
+    let under_pct = db::list_photos_under(&conn, &c).unwrap();
+    assert_eq!(under_pct.len(), 1, "目录名里的 % 不得被 LIKE 当通配符");
+    assert_eq!(under_pct[0].file_name, "c.jpg");
+
+    drop(conn);
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// 回归：增量清理按 scan_root_id 精确作用，扫描第二个根不得清空第一个根的索引。
+#[test]
+fn sweep_photos_is_scoped_to_scan_root() {
+    let base = temp_dir("sweep");
+    let root1 = base.join("root1");
+    let root2 = base.join("root2");
+    make_jpeg(&root1.join("a.jpg"), 1, 2, 3);
+    make_jpeg(&root2.join("b.jpg"), 4, 5, 6);
+
+    let paths = Paths::from_app_dir(base.join("appdata"));
+    paths.ensure_dirs().unwrap();
+    let conn = db::open(&paths.db_path).unwrap();
+    scanner::scan_root(&paths, &conn, &root1, None).unwrap();
+    scanner::scan_root(&paths, &conn, &root2, None).unwrap();
+    assert_eq!(db::count_photos(&conn).unwrap(), 2, "扫描第二个根不得清空第一个根");
+
+    let r1 = db::upsert_scan_root(&conn, &root1).unwrap();
+    assert_eq!(db::sweep_photos(&conn, r1, &[root1.join("a.jpg")]).unwrap(), 0);
+    assert_eq!(db::count_photos(&conn).unwrap(), 2);
+
+    assert_eq!(db::sweep_photos(&conn, r1, &[]).unwrap(), 1);
+    assert_eq!(db::count_photos(&conn).unwrap(), 1, "root2 的记录必须保留");
+    assert!(db::get_photo_by_path(&conn, &root2.join("b.jpg")).unwrap().is_some());
+
+    drop(conn);
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// 回归：0 字节缓存是上次写入崩溃留下的残片，必须重新生成而不是直接复用。
+#[test]
+fn zero_byte_thumbnail_cache_is_regenerated() {
+    let base = temp_dir("thumb_zero");
+    let src = base.join("photo.jpg");
+    make_jpeg(&src, 10, 20, 30);
+    let paths = Paths::from_app_dir(base.join("appdata"));
+    paths.ensure_dirs().unwrap();
+
+    let t1 = akashic::core::thumbnail::ensure_thumbnail(&paths, &src, "zero-hash").unwrap();
+    fs::write(&t1, b"").unwrap();
+    assert_eq!(fs::metadata(&t1).unwrap().len(), 0);
+    let t2 = akashic::core::thumbnail::ensure_thumbnail(&paths, &src, "zero-hash").unwrap();
+    assert_eq!(t1, t2);
+    assert!(fs::metadata(&t2).unwrap().len() > 0, "0 字节缓存必须被重建");
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// 回归：缓存目录丢失要能重建；哈希退化 key 要加 fb_ 前缀且与正常 key 命名空间隔离。
+#[test]
+fn thumbnail_recreates_cache_dir_and_namespaces_fallback() {
+    let base = temp_dir("thumb_dir");
+    let src1 = base.join("photo1.jpg");
+    let src2 = base.join("photo2.jpg");
+    make_jpeg(&src1, 10, 20, 30);
+    make_jpeg(&src2, 30, 20, 10);
+    let paths = Paths::from_app_dir(base.join("appdata"));
+    paths.ensure_dirs().unwrap();
+
+    let t = akashic::core::thumbnail::ensure_thumbnail(&paths, &src1, "normal-hash").unwrap();
+    assert!(t.exists());
+    fs::remove_dir_all(&paths.cache_dir).unwrap();
+    let t2 = akashic::core::thumbnail::ensure_thumbnail(&paths, &src1, "normal-hash").unwrap();
+    assert!(t2.exists() && fs::metadata(&t2).unwrap().len() > 0, "缓存目录应被重建");
+
+    let f1 = akashic::core::thumbnail::ensure_thumbnail(&paths, &src1, "").unwrap();
+    let f2 = akashic::core::thumbnail::ensure_thumbnail(&paths, &src2, "").unwrap();
+    let n1 = f1.file_name().unwrap().to_string_lossy().to_string();
+    assert!(n1.starts_with("fb_"), "退化 key 需加 fb_ 前缀: {n1}");
+    assert_ne!(f1, f2, "不同来源的退化 key 不得互相覆盖缓存");
+    assert!(!n1.contains("normal-hash"), "退化 key 与正常内容哈希命名空间应隔离");
+
+    fs::remove_dir_all(&base).unwrap();
+}

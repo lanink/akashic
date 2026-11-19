@@ -128,3 +128,82 @@ fn rerun_analysis_is_idempotent() {
     drop(conn);
     let _ = fs::remove_dir_all(&base);
 }
+
+/// 回归：坏图（解码失败）绝不能被写成 blur_score = 0.0 并计入「已分析 / 模糊列表」。
+#[test]
+fn corrupt_image_is_not_recorded_as_zero_blur() {
+    let base = temp_dir("corrupt");
+    let photos_dir = base.join("photos");
+    fs::create_dir_all(&photos_dir).unwrap();
+    let good = photos_dir.join("good.jpg");
+    make_sharp(&good);
+    // 放在扫描根之外，不会被索引；用来模拟索引指向一个已损坏的文件。
+    let broken = base.join("broken.jpg");
+    fs::write(&broken, b"this is definitely not a jpeg").unwrap();
+
+    let paths = Paths::from_app_dir(base.join("appdata"));
+    paths.ensure_dirs().unwrap();
+    let conn = db::open(&paths.db_path).unwrap();
+    scanner::scan_root(&paths, &conn, &photos_dir, None).unwrap();
+    let id = db::list_photos(&conn).unwrap()[0].id;
+    conn.execute(
+        "UPDATE photos SET path=?1, file_name='broken.jpg', thumbnail_path=NULL WHERE id=?2",
+        rusqlite::params![broken.to_string_lossy().to_string(), id],
+    )
+    .unwrap();
+
+    let photo = db::get_photo_by_id(&conn, id).unwrap().unwrap();
+    assert!(
+        akashic::core::analyze::analyze_photo(&photo).is_none(),
+        "坏图不得产出分析结果"
+    );
+
+    let report = analyze_library(&conn, None).unwrap();
+    assert_eq!(report.photos_failed, 1);
+    assert_eq!(report.photos_analyzed, 0);
+    let after = db::get_photo_by_id(&conn, id).unwrap().unwrap();
+    assert_eq!(after.blur_score, None, "坏图不得被写成 0.0");
+    assert_eq!(db::count_analyzed(&conn).unwrap(), 0, "坏图不得计入已分析");
+    assert!(db::list_blurry(&conn, 10).unwrap().is_empty(), "坏图不得出现在模糊列表");
+
+    drop(conn);
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// 回归：纯色/低纹理图没有可比较的结构特征，pHash 应返回 None，
+/// 否则所有纯色图会得到同一个伪哈希并被判成巨量相似组。
+#[test]
+fn flat_color_image_has_no_phash() {
+    let flat = image::GrayImage::from_pixel(64, 64, image::Luma([128]));
+    assert_eq!(
+        akashic::core::analyze::similarity::phash_from_gray(&flat),
+        None,
+        "纯色图不得得到伪哈希"
+    );
+    let striped = image::GrayImage::from_fn(64, 64, |x, _| {
+        image::Luma([if (x / 8) % 2 == 0 { 255 } else { 0 }])
+    });
+    assert!(
+        akashic::core::analyze::similarity::phash_from_gray(&striped).is_some(),
+        "有纹理的图应能算出哈希"
+    );
+}
+
+/// 回归：代表元聚类不得把 A~B、B~C 但 A≁C 串成一个巨组
+/// （旧并查集传递闭包会把所有链式相近的图并成一组）。
+#[test]
+fn representative_clustering_does_not_chain_transitively() {
+    let h = akashic::core::analyze::similarity::hamming;
+    let group = akashic::core::analyze::similarity::group_by_phash;
+    let a: u64 = 0;
+    let b: u64 = 0b0000_1111;
+    let c: u64 = 0b1111_1111;
+    assert_eq!(h(a, b), 4);
+    assert_eq!(h(b, c), 4);
+    assert_eq!(h(a, c), 8);
+
+    let groups = group(&[(1, a), (2, b), (3, c)], 4);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0], vec![1, 2]);
+    assert!(!groups.iter().any(|g| g.len() >= 3), "不得产生 3 人巨组: {groups:?}");
+}

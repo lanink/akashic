@@ -207,8 +207,9 @@ fn four_rules_and_missing_metadata_fallback() {
     .unwrap();
     let cases: [(ArchiveRule, Vec<&str>); 4] = [
         (ArchiveRule::ByYear, vec!["未知日期"]),
-        (ArchiveRule::ByYearMonth, vec!["未知日期", "未知日期"]),
-        (ArchiveRule::ByStory, vec!["未知日期", "未知日期_未命名故事"]),
+        // 缺失日期不应生成两层同名的「未知日期」目录。
+        (ArchiveRule::ByYearMonth, vec!["未知日期", "未知月份"]),
+        (ArchiveRule::ByStory, vec!["未知日期", "未知月份_未命名故事"]),
         (ArchiveRule::ByTag, vec!["未分类"]),
     ];
     for (rule, expected) in cases {
@@ -252,6 +253,57 @@ fn plan_is_read_only_and_settings_roundtrip() {
     assert_eq!(db::get_setting(&conn, "archive.rule").unwrap().as_deref(), Some("tag"));
     assert_eq!(db::get_setting(&conn, "archive.mode").unwrap().as_deref(), Some("move"));
     assert_eq!(db::get_setting(&conn, "not.exist").unwrap(), None);
+
+    cleanup(&paths, conn);
+}
+
+/// 回归：归档目标必须是绝对路径，且不能位于照片目录内部，
+/// 否则归档产物会被下次扫描反复索引 / 反复归档。
+#[test]
+fn plan_rejects_relative_or_internal_dest() {
+    let (paths, conn, photos, ids) = setup(1);
+
+    let relative = PathBuf::from("相对归档目录");
+    assert!(
+        archive::plan(&conn, &ids, ArchiveRule::ByYear, ArchiveMode::Move, &relative).is_err(),
+        "相对路径目标必须拒绝"
+    );
+
+    let inside = photos.join("归档");
+    assert!(
+        archive::plan(&conn, &ids, ArchiveRule::ByYear, ArchiveMode::Move, &inside).is_err(),
+        "目标位于照片目录内部时必须拒绝"
+    );
+
+    cleanup(&paths, conn);
+}
+
+/// 回归：Copy 模式执行后副本也会进入主索引，再次归档时必须跳过位于 dest_root 内的副本，
+/// 否则副本会被再复制一遍，出现指数级增殖。
+#[test]
+fn copy_mode_second_run_skips_existing_copies() {
+    let (paths, conn, _photos, ids) = setup(2);
+    let dest = dest_of(&paths);
+
+    let p1 = archive::plan(&conn, &ids, ArchiveRule::ByYear, ArchiveMode::Copy, &dest).unwrap();
+    assert_eq!(p1.total_files, 2);
+    archive::execute(&conn, &p1).unwrap();
+    assert_eq!(db::count_photos(&conn).unwrap(), 4, "源文件 + 副本都应进入索引");
+
+    let all_ids: Vec<i64> = db::list_photos(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    let p2 = archive::plan(&conn, &all_ids, ArchiveRule::ByYear, ArchiveMode::Copy, &dest).unwrap();
+    assert_eq!(p2.total_files, 2, "副本不得再被归档一次");
+    for item in &p2.items {
+        assert!(
+            !item.from_path.starts_with(&dest),
+            "副本不得成为归档源: {}",
+            item.from_path.display()
+        );
+    }
 
     cleanup(&paths, conn);
 }

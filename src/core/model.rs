@@ -3,6 +3,10 @@
 
 use std::path::PathBuf;
 
+/// Laplacian 方差低于此值判定为模糊。
+/// 放在 model 层，供 `analyze::blur` 与 `db::list_blurry` 共用同一阈值，避免两处漂移。
+pub const BLUR_THRESHOLD: f64 = 100.0;
+
 /// 一张真实照片的索引记录（对应 SQLite `photos` 表一行）。
 #[derive(Clone, Debug)]
 pub struct Photo {
