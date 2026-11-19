@@ -1787,6 +1787,7 @@ impl AppRoot {
                         let mut row_el = div()
                             .id(("photo-row", row))
                             .flex().flex_row()
+                            .w_full()
                             .gap(px(12.))
                             .h(px(GRID_ROW_HEIGHT))
                             .pb(px(12.));
@@ -1804,6 +1805,7 @@ impl AppRoot {
                                 .overflow_hidden()
                                 .h(px(GRID_TILE_HEIGHT))
                                 .flex_1()
+                                .min_w(px(120.))
                                 .bg(photo_block_bg(stable_hue(&photo.path.to_string_lossy())))
                                 .border_2()
                                 .when(is_selected, |b| b.border_color(col(GOLD)))
@@ -1846,7 +1848,12 @@ impl AppRoot {
                 .id("photo-grid-scroll")
                 .flex_1()
                 .min_h_0()
-                .child(list.size_full())
+                // 必须是 flex 容器：uniform_list 作为 flex item 由 cross-axis stretch 直接拿到宽度。
+                // 若这里是默认 Block，列表的百分比宽度会回退成首行 min-content，
+                // 4 个 flex_1 的 tile 被压成几条竖线（只剩 gap 可见）。
+                .flex()
+                .flex_col()
+                .child(list.flex_1().min_h_0())
                 .into_any_element()
         };
 
