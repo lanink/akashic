@@ -6,8 +6,24 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use imageflow_core::Context;
+use imageflow_core::{Context, IoDirection};
 use imageflow_types as s;
+
+/// 输出格式：预览用 JPEG（编码快、文件小），另存为用 PNG（无损）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OutputFormat {
+    Png,
+    Jpeg,
+}
+
+impl OutputFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            OutputFormat::Png => "png",
+            OutputFormat::Jpeg => "jpg",
+        }
+    }
+}
 
 /// 颜色滤镜（直接映射 imageflow 的 `ColorFilterSrgb`）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,12 +108,20 @@ impl EditOptions {
         }
     }
 
-    fn steps(&self) -> Vec<s::Node> {
+    /// 构造 imageflow 图节点。
+    ///
+    /// `decode_hints` 只在 JPEG 预览且 `max_dimension > 0` 时提供，让解码器直接输出
+    /// 接近目标尺寸的小图，避免先全分辨率解码再缩小的开销。
+    fn steps(
+        &self,
+        format: OutputFormat,
+        decode_hints: Option<s::JpegIDCTDownscaleHints>,
+    ) -> Vec<s::Node> {
         let mut nodes = Vec::new();
         // EXIF 方向由 imageflow 解码阶段自动应用（默认行为），这里只叠加用户显式编辑。
         nodes.push(s::Node::Decode {
             io_id: 0,
-            commands: None,
+            commands: decode_hints.map(|h| vec![s::DecoderCommand::JpegDownscaleHints(h)]),
         });
         match self.normalized_rotation() {
             90 => nodes.push(s::Node::Rotate90),
@@ -139,22 +163,29 @@ impl EditOptions {
                 canvas_color: None,
             }));
         }
-        // 编辑器统一输出 PNG：无损、支持透明、无需猜测输入格式对应的编码器。
-        nodes.push(s::Node::Encode {
-            io_id: 1,
-            preset: s::EncoderPreset::Lodepng {
+        let preset = match format {
+            OutputFormat::Png => s::EncoderPreset::Lodepng {
                 maximum_deflate: Some(false),
             },
-        });
+            // 预览用 libjpeg-turbo 直接出 JPEG：比逐像素 PNG 编码快得多，文件也更小。
+            OutputFormat::Jpeg => s::EncoderPreset::LibjpegTurbo {
+                quality: Some(88),
+                progressive: Some(false),
+                optimize_huffman_coding: Some(false),
+                matte: None,
+            },
+        };
+        nodes.push(s::Node::Encode { io_id: 1, preset });
         nodes
     }
 }
 
-/// 把 `src` 按 `options` 编辑后写成 PNG 到 `dst`。
-///
-/// 输出先写同目录临时文件再原子改名，避免中途失败留下半截图片被 UI 当作有效预览。
-/// 注意：`apply` 是同步阻塞调用，必须由调用方放到后台线程/执行器上执行。
-pub fn apply(src: &Path, dst: &Path, options: &EditOptions) -> Result<()> {
+fn apply_inner(
+    src: &Path,
+    dst: &Path,
+    options: &EditOptions,
+    format: OutputFormat,
+) -> Result<()> {
     if !src.is_file() {
         bail!("原图不存在: {}", src.display());
     }
@@ -162,18 +193,39 @@ pub fn apply(src: &Path, dst: &Path, options: &EditOptions) -> Result<()> {
     std::fs::create_dir_all(parent)
         .with_context(|| format!("创建编辑输出目录失败: {}", parent.display()))?;
 
-    let bytes = std::fs::read(src)
-        .with_context(|| format!("读取原图失败: {}", src.display()))?;
+    // 直接交给 imageflow 按文件流读取，避免先把整张原图读进内存再复制进 Context。
+    let src_str = src
+        .to_str()
+        .with_context(|| format!("原图路径不是 UTF-8: {}", src.display()))?;
     let mut ctx = Context::create().context("初始化 imageflow 上下文失败")?;
-    ctx.add_input_vector(0, bytes)
-        .context("imageflow 装载原图失败")?;
+    ctx.add_file(0, IoDirection::In, src_str)
+        .with_context(|| format!("imageflow 装载原图失败: {}", src.display()))?;
+
+    // JPEG 预览：让解码器在 IDCT 阶段直接缩小，避免「全分辨率解码 → 再缩放」的双重开销。
+    let decode_hints = if format == OutputFormat::Jpeg && options.max_dimension > 0 {
+        ctx.get_unscaled_rotated_image_info(0).ok().map(|info| {
+            let w = info.image_width.max(1) as f64;
+            let h = info.image_height.max(1) as f64;
+            let max = options.max_dimension as f64;
+            let scale = (max / w.max(h)).min(1.0);
+            s::JpegIDCTDownscaleHints {
+                width: (w * scale).round().max(1.0) as i64,
+                height: (h * scale).round().max(1.0) as i64,
+                scale_luma_spatially: Some(true),
+                gamma_correct_for_srgb_during_spatial_luma_scaling: Some(true),
+            }
+        })
+    } else {
+        None
+    };
+
     ctx.add_output_buffer(1)
         .context("imageflow 创建输出缓冲区失败")?;
     ctx.execute_1(s::Execute001 {
         job_options: None,
         graph_recording: None,
         security: None,
-        framewise: s::Framewise::Steps(options.steps()),
+        framewise: s::Framewise::Steps(options.steps(format, decode_hints)),
     })
     .context("imageflow 执行编辑失败")?;
     let output = ctx
@@ -183,10 +235,44 @@ pub fn apply(src: &Path, dst: &Path, options: &EditOptions) -> Result<()> {
         bail!("imageflow 输出为空: {}", src.display());
     }
 
+    write_atomic(dst, &output)
+}
+
+/// 把 `src` 按 `options` 编辑后写成无损 PNG 到 `dst`（用于另存为）。
+///
+/// 输出先写同目录临时文件再原子改名，避免中途失败留下半截图片被 UI 当作有效结果。
+/// 同步阻塞调用，必须由调用方放到后台线程/执行器上执行。
+pub fn apply(src: &Path, dst: &Path, options: &EditOptions) -> Result<()> {
+    apply_inner(src, dst, options, OutputFormat::Png)
+}
+
+/// 快速预览：与 `apply` 同一条编辑流水线，但输出 JPEG，并在 JPEG 解码阶段
+/// 按 `max_dimension` 直接降采样。调用方仍需放在后台执行器上。
+pub fn apply_preview(src: &Path, dst: &Path, options: &EditOptions) -> Result<()> {
+    apply_inner(src, dst, options, OutputFormat::Jpeg)
+}
+
+/// 编辑结果的缓存路径：按「源文件路径 + 参数指纹 + 输出格式」命名。
+/// 不同参数互不覆盖，避免后台任务乱序返回时把旧预览写到新预览文件上。
+pub fn preview_path(
+    base: &Path,
+    src: &Path,
+    options: &EditOptions,
+    format: OutputFormat,
+) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = twox_hash::XxHash64::default();
+    src.to_string_lossy().as_bytes().hash(&mut hasher);
+    format!("{options:?}").hash(&mut hasher);
+    format.hash(&mut hasher);
+    base.join(format!("edit-{:016x}.{}", hasher.finish(), format.extension()))
+}
+
+fn write_atomic(dst: &Path, output: &[u8]) -> Result<()> {
     let tmp = temp_output_path(dst);
     // 清理上次崩溃遗留的同名临时文件，write 会覆盖已有内容，这里主要避免误用旧文件。
     let _ = std::fs::remove_file(&tmp);
-    std::fs::write(&tmp, &output)
+    std::fs::write(&tmp, output)
         .with_context(|| format!("写入编辑结果失败: {}", tmp.display()))?;
     match std::fs::rename(&tmp, dst) {
         Ok(()) => Ok(()),
@@ -206,18 +292,6 @@ pub fn apply(src: &Path, dst: &Path, options: &EditOptions) -> Result<()> {
     }
 }
 
-/// 编辑器的预览输出路径：放在应用数据目录下，按「源文件稳定哈希 + 参数指纹」命名。
-/// 不同参数互不覆盖，避免后台任务乱序返回时把旧预览写到新预览文件上。
-pub fn preview_path(base: &Path, src: &Path, options: &EditOptions) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = twox_hash::XxHash64::default();
-    src.to_string_lossy().as_bytes().hash(&mut hasher);
-    for node in options.steps() {
-        format!("{node:?}").hash(&mut hasher);
-    }
-    base.join(format!("edit-{:016x}.png", hasher.finish()))
-}
-
 fn temp_output_path(dst: &Path) -> PathBuf {
     let name = dst
         .file_name()
@@ -230,7 +304,7 @@ fn temp_output_path(dst: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ImageBuffer, Rgb};
+    use image::{GenericImageView, ImageBuffer, Rgb};
 
     fn sample_png(path: &Path, w: u32, h: u32) {
         let img = ImageBuffer::from_fn(w, h, |x, y| Rgb([
@@ -330,10 +404,10 @@ mod tests {
     }
 
     #[test]
-    fn preview_path_changes_with_options() {
+    fn preview_path_changes_with_options_and_format() {
         let base = PathBuf::from("/tmp/akashic-editor");
         let src = PathBuf::from("/photos/a.png");
-        let a = preview_path(&base, &src, &EditOptions::default());
+        let a = preview_path(&base, &src, &EditOptions::default(), OutputFormat::Jpeg);
         let b = preview_path(
             &base,
             &src,
@@ -341,9 +415,81 @@ mod tests {
                 rotate_degrees: 90,
                 ..Default::default()
             },
+            OutputFormat::Jpeg,
         );
+        let png = preview_path(&base, &src, &EditOptions::default(), OutputFormat::Png);
         assert_ne!(a, b);
+        assert_ne!(a, png);
         assert_eq!(a.parent(), Some(base.as_path()));
-        assert!(a.extension().and_then(|e| e.to_str()) == Some("png"));
+        assert_eq!(a.extension().and_then(|e| e.to_str()), Some("jpg"));
+        assert_eq!(png.extension().and_then(|e| e.to_str()), Some("png"));
+    }
+
+    #[test]
+    fn preview_uses_jpeg_and_decoder_downscale_hints() {
+        let dir = TempDir::new("preview-jpeg");
+        let src = dir.path().join("src.png");
+        let dst = dir.path().join("preview.jpg");
+        sample_png(&src, 400, 200);
+        let opts = EditOptions {
+            max_dimension: 64,
+            ..Default::default()
+        };
+        apply_preview(&src, &dst, &opts).unwrap();
+        let decoded = image::open(&dst).unwrap();
+        let (w, h) = decoded.dimensions();
+        assert!(w <= 64 && h <= 64, "预览应缩小到最长边 64, got {w}x{h}");
+        assert_eq!(w, h * 2, "等比缩放应保持 2:1, got {w}x{h}");
+        assert!(std::fs::metadata(&dst).unwrap().len() > 0);
+    }
+
+    /// 手动性能对比：旧预览（全分辨率解码 + PNG 编码）vs 新预览（JPEG 解码降采样 + JPEG 编码）。
+    /// 用 `cargo test --lib preview_performance_comparison -- --ignored --nocapture` 运行。
+    #[test]
+    #[ignore = "性能基准：需要时手动运行"]
+    fn preview_performance_comparison() {
+        let dir = TempDir::new("perf");
+        let src = dir.path().join("large.jpg");
+        let img = ImageBuffer::from_fn(4000, 3000, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+        });
+        image::save_buffer_with_format(
+            &src,
+            img.as_raw(),
+            4000,
+            3000,
+            image::ColorType::Rgb8,
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+
+        let opts = EditOptions {
+            rotate_degrees: 90,
+            filter: ColorFilter::Sepia,
+            max_dimension: 1600,
+            ..Default::default()
+        };
+        let old_dst = dir.path().join("old-preview.png");
+        let new_dst = dir.path().join("new-preview.jpg");
+
+        let t0 = std::time::Instant::now();
+        apply(&src, &old_dst, &opts).unwrap();
+        let old_ms = t0.elapsed().as_millis();
+
+        let t1 = std::time::Instant::now();
+        apply_preview(&src, &new_dst, &opts).unwrap();
+        let new_ms = t1.elapsed().as_millis();
+
+        println!(
+            "4000x3000 JPEG -> 1600px: old PNG preview {}ms, new JPEG preview {}ms",
+            old_ms, new_ms
+        );
+
+        // 第二次之后的交互都在这张 1600px 底图上运行，才是用户实际感受到的速度。
+        let edit_dst = dir.path().join("edit-preview.jpg");
+        let t2 = std::time::Instant::now();
+        apply_preview(&new_dst, &edit_dst, &opts).unwrap();
+        println!("1600px base -> edited preview: {}ms", t2.elapsed().as_millis());
+        assert!(edit_dst.is_file());
     }
 }

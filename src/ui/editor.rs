@@ -1,16 +1,21 @@
-//! 原图编辑浮窗：点击照片后以独立窗口展示原图，并用 imageflow 做本地编辑。
+//! 原图编辑浮窗：点击照片后以独立窗口展示快速预览，并用 imageflow 做本地编辑。
 //!
 //! 编辑能力：旋转 / 翻转 / 灰度·棕褐·反色 / 亮度·对比度·饱和度 / 等比缩放。
-//! 预览在后台执行器运行，不阻塞主窗口；「另存为」按原分辨率输出 PNG。
+//! 性能策略：打开时只从原图生成一次 1600px JPEG 底图，后续交互都在底图上处理；
+//! 连续点击做 80ms 合并 + 单飞行任务，避免重复全分辨率解码/PNG 编码；
+//! 「另存为」才按原分辨率输出 PNG。
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::*;
 use gpui_component::Root;
 use gpui_component::button::Button;
 
 use crate::core::config::Paths;
-use crate::core::edit::{ColorFilter, EditOptions, apply, preview_path};
+use crate::core::edit::{
+    ColorFilter, EditOptions, OutputFormat, apply, apply_preview, preview_path,
+};
 use crate::core::model::Photo;
 use crate::ui::window_titlebar;
 
@@ -22,6 +27,11 @@ const BORDER_LIGHT: u32 = 0xE8E4DE;
 const GOLD: u32 = 0xC9A96E;
 const DANGER: u32 = 0xE0544C;
 
+/// 交互预览的最长边。底图与编辑预览都用这个尺寸，足够 1100×760 浮窗显示。
+const PREVIEW_MAX_DIMENSION: u32 = 1600;
+/// 连续点击合并窗口：只重跑最后一次参数，避免每个 +/- 点击都触发一次全流水线。
+const PREVIEW_DEBOUNCE_MS: u64 = 80;
+
 fn col(hex: u32) -> gpui::Hsla {
     gpui::Hsla::from(gpui::rgb(hex))
 }
@@ -31,14 +41,23 @@ pub struct PhotoEditor {
     source: PathBuf,
     paths: Paths,
     label: String,
-    /// 当前展示的图片路径：未编辑时是原图，编辑成功后指向缓存的 PNG。
+    /// 当前展示的图片路径：优先缓存底图/缩略图，其次原图；编辑成功后指向结果图。
     preview: PathBuf,
+    /// 由原图生成的一次性快速底图；后续编辑都基于它，避免反复处理全分辨率原图。
+    base: Option<PathBuf>,
+    base_started: bool,
+    base_ready: bool,
     options: EditOptions,
     status: String,
     error: Option<String>,
     busy: bool,
     /// 后台任务代次：旧任务返回时若代次已变则丢弃，避免慢任务覆盖新预览。
     generation: u64,
+    /// 预览任务正在运行（含 debounce 等待）；新变更先记 pending，完成后只重跑最后一次。
+    preview_running: bool,
+    pending_preview: bool,
+    /// 另存为单独计数，避免它取消正在进行的预览任务。
+    save_running: bool,
 }
 
 impl PhotoEditor {
@@ -48,30 +67,135 @@ impl PhotoEditor {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "未命名照片".to_string());
-        let status = if source.is_file() {
-            "原图 · 未编辑".to_string()
+
+        let preview_dir = paths.data_dir.join("editor");
+        let cached_base = preview_path(
+            &preview_dir,
+            &source,
+            &Self::base_options(),
+            OutputFormat::Jpeg,
+        );
+        // 缓存底图仍然新于原图时直接复用，重开浮窗无需再解码一次大图。
+        let cached_ok = cached_base.is_file()
+            && match (
+                std::fs::metadata(&cached_base).and_then(|m| m.modified()),
+                std::fs::metadata(&source).and_then(|m| m.modified()),
+            ) {
+                (Ok(base_time), Ok(src_time)) => base_time >= src_time,
+                _ => false,
+            };
+        let initial = if cached_ok {
+            cached_base.clone()
         } else {
-            "原图文件已移动或删除，编辑不可用".to_string()
+            photo
+                .thumbnail_path
+                .clone()
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| source.clone())
         };
+        let status = if !source.is_file() {
+            "原图文件已移动或删除，编辑不可用".to_string()
+        } else if cached_ok {
+            "快速预览已就绪（最长边 1600px）".to_string()
+        } else {
+            "正在准备快速预览（最长边 1600px）…".to_string()
+        };
+
         Self {
-            preview: source.clone(),
+            preview: initial,
+            base: cached_ok.then_some(cached_base),
+            base_started: cached_ok,
+            base_ready: cached_ok,
             photo,
             source,
             paths,
             label,
-            options: EditOptions {
-                max_dimension: 1600,
-                ..Default::default()
-            },
+            options: EditOptions::default(),
             status,
             error: None,
             busy: false,
             generation: 0,
+            preview_running: false,
+            pending_preview: false,
+            save_running: false,
+        }
+    }
+
+    fn base_options() -> EditOptions {
+        EditOptions {
+            max_dimension: PREVIEW_MAX_DIMENSION,
+            ..Default::default()
         }
     }
 
     fn preview_dir(&self) -> PathBuf {
         self.paths.data_dir.join("editor")
+    }
+
+    /// 浮窗创建后调用：若没有可复用底图则启动一次性构建。
+    pub fn start(&mut self, cx: &mut Context<Self>) {
+        if !self.base_ready {
+            self.ensure_base(cx);
+        }
+    }
+
+    fn ensure_base(&mut self, cx: &mut Context<Self>) {
+        if self.base_started {
+            return;
+        }
+        self.base_started = true;
+        if !self.source.is_file() {
+            self.base_ready = true;
+            self.error = Some("原图文件不存在，无法编辑".to_string());
+            cx.notify();
+            return;
+        }
+        self.busy = true;
+        self.status = "正在准备 1600px 快速预览…".to_string();
+
+        let src = self.source.clone();
+        let dest = preview_path(
+            &self.preview_dir(),
+            &self.source,
+            &Self::base_options(),
+            OutputFormat::Jpeg,
+        );
+        let options = Self::base_options();
+        let task_dest = dest.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { apply_preview(&src, &task_dest, &options) });
+        cx.spawn(async move |this, app| {
+            let result = task.await;
+            let _ = this.update(app, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.base = Some(dest.clone());
+                        this.base_ready = true;
+                        this.preview = dest;
+                        this.status = "快速预览已就绪（最长边 1600px）".to_string();
+                        this.error = None;
+                    }
+                    Err(e) => {
+                        // 底图失败不应让编辑不可用：回退原图，后续编辑仍在后台执行。
+                        this.base = Some(this.source.clone());
+                        this.base_ready = true;
+                        this.preview = this.source.clone();
+                        this.status = "已回退原图预览".to_string();
+                        this.error = Some(format!("快速预览生成失败：{e:#}"));
+                    }
+                }
+                this.busy = this.preview_running || this.save_running;
+                if this.pending_preview {
+                    this.pending_preview = false;
+                    let generation = this.generation;
+                    this.spawn_preview(generation, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn mutate(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut EditOptions)) {
@@ -88,42 +212,86 @@ impl PhotoEditor {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.busy = true;
-        self.status = "正在用 imageflow 生成预览 …".to_string();
+        self.status = "正在生成预览 …".to_string();
         self.error = None;
 
-        let src = self.source.clone();
-        let dest = preview_path(&self.preview_dir(), &self.source, &self.options);
-        let task_dest = dest.clone();
+        if !self.base_ready {
+            // 底图还没好：先启动底图，底图完成后再跑最新参数。
+            self.pending_preview = true;
+            self.ensure_base(cx);
+            cx.notify();
+            return;
+        }
+        self.spawn_preview(generation, cx);
+        cx.notify();
+    }
+
+    /// 启动一次预览任务；若已有任务在飞，只登记 pending，完成后重跑最新参数。
+    fn spawn_preview(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if self.preview_running {
+            self.pending_preview = true;
+            return;
+        }
+        let src = self.base.clone().unwrap_or_else(|| self.source.clone());
         let options = self.options;
-        let task = cx.background_executor().spawn(async move { apply(&src, &task_dest, &options) });
+        let dest = preview_path(&self.preview_dir(), &src, &options, OutputFormat::Jpeg);
+        self.preview_running = true;
+
         cx.spawn(async move |this, app| {
-            let result = task.await;
+            // 80ms 内连续点击合并为一次，等待期间若参数已变则直接退出。
+            gpui::background_executor()
+                .timer(Duration::from_millis(PREVIEW_DEBOUNCE_MS))
+                .await;
+            let superseded = this
+                .update(app, |this, _| this.generation != generation)
+                .unwrap_or(true);
+            if superseded {
+                let _ = this.update(app, |this, cx| {
+                    this.preview_running = false;
+                    this.busy = this.preview_running || this.save_running;
+                    if this.pending_preview {
+                        this.pending_preview = false;
+                        let generation = this.generation;
+                        this.spawn_preview(generation, cx);
+                    }
+                    cx.notify();
+                });
+                return;
+            }
+
+            let task_dest = dest.clone();
+            let result = gpui::background_executor()
+                .spawn(async move { apply_preview(&src, &task_dest, &options) })
+                .await;
             let _ = this.update(app, |this, cx| {
-                // 只有最新一次请求可以提交结果。
-                if this.generation != generation {
-                    return;
+                this.preview_running = false;
+                if this.generation == generation {
+                    match result {
+                        Ok(()) => {
+                            this.preview = dest;
+                            this.status = if this.options.has_user_edits() {
+                                "已应用编辑 · 快速预览（最长边 1600px）".to_string()
+                            } else {
+                                "快速预览已就绪（最长边 1600px）".to_string()
+                            };
+                            this.error = None;
+                        }
+                        Err(e) => {
+                            this.error = Some(format!("编辑失败：{e:#}"));
+                            this.status = "预览失败，仍显示上一张图片".to_string();
+                        }
+                    }
                 }
-                this.busy = false;
-                match result {
-                    Ok(()) => {
-                        this.preview = dest;
-                        this.status = if this.options.has_user_edits() {
-                            "已应用编辑 · 预览最长边 1600px".to_string()
-                        } else {
-                            "原图 · 未编辑（预览最长边 1600px）".to_string()
-                        };
-                        this.error = None;
-                    }
-                    Err(e) => {
-                        this.error = Some(format!("编辑失败：{e:#}"));
-                        this.status = "预览失败，仍显示上一张图片".to_string();
-                    }
+                this.busy = this.preview_running || this.save_running;
+                if this.pending_preview {
+                    this.pending_preview = false;
+                    let generation = this.generation;
+                    this.spawn_preview(generation, cx);
                 }
                 cx.notify();
             });
         })
         .detach();
-        cx.notify();
     }
 
     fn save_as(&mut self, cx: &mut Context<Self>, dest: PathBuf) {
@@ -132,16 +300,19 @@ impl PhotoEditor {
             cx.notify();
             return;
         }
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
+        self.save_running = true;
         self.busy = true;
         self.status = format!("正在保存原分辨率 PNG 到 {} …", dest.display());
         self.error = None;
 
         let src = self.source.clone();
-        let mut options = self.options;
-        options.max_dimension = 0;
-        let staged = preview_path(&self.preview_dir(), &self.source, &options);
+        let options = self.options;
+        let staged = preview_path(
+            &self.preview_dir(),
+            &self.source,
+            &options,
+            OutputFormat::Png,
+        );
         let target = dest.clone();
         let task = cx.background_executor().spawn(async move {
             apply(&src, &staged, &options)?;
@@ -152,10 +323,8 @@ impl PhotoEditor {
         cx.spawn(async move |this, app| {
             let result = task.await;
             let _ = this.update(app, |this, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                this.busy = false;
+                this.save_running = false;
+                this.busy = this.preview_running || this.save_running;
                 match result {
                     Ok(()) => {
                         this.status = format!("已保存：{}", dest.display());
@@ -292,10 +461,7 @@ impl Render for PhotoEditor {
             })
             .child(
                 self.tool_button("重置全部编辑", cx, |this, cx| {
-                    this.options = EditOptions {
-                        max_dimension: 1600,
-                        ..Default::default()
-                    };
+                    this.options = EditOptions::default();
                     this.schedule_preview(cx);
                 }),
             )
@@ -483,7 +649,7 @@ fn pair(
         .into_any_element()
 }
 
-/// 从主窗口点击照片处调用：打开独立浮窗展示原图并编辑。
+/// 从主窗口点击照片处调用：打开独立浮窗展示快速预览并编辑。
 pub fn open_photo_editor(photo: Photo, paths: Paths, cx: &mut App) {
     let options = WindowOptions {
         kind: WindowKind::Floating,
@@ -505,6 +671,7 @@ pub fn open_photo_editor(photo: Photo, paths: Paths, cx: &mut App) {
     };
     if let Err(e) = cx.open_window(options, |window, cx| {
         let editor = cx.new(|_| PhotoEditor::new(photo, paths.clone()));
+        editor.update(cx, |editor, cx| editor.start(cx));
         cx.new(|cx| Root::new(editor, window, cx))
     }) {
         eprintln!("[akashic] 打开原图编辑窗口失败: {e}");
