@@ -1799,8 +1799,11 @@ impl AppRoot {
                             let location = photo.location.clone().unwrap_or_default();
                             let dialog_photo = photo.clone();
                             let tile_app = app_for_list.clone();
-                            let tile = Button::new(("photo", idx))
-                                .p(px(0.))
+                            // 与整理页 render_photo_list 一致用 div 做 tile：
+                            // gpui-component 的 Button 内部有独立 flex/padding 布局，
+                            // img().size_full() 直接塞进去会塌陷成竖线；div + 明确尺寸容器才稳定。
+                            let tile = div()
+                                .id(("photo", idx))
                                 .relative()
                                 .overflow_hidden()
                                 .h(px(GRID_TILE_HEIGHT))
@@ -1808,9 +1811,16 @@ impl AppRoot {
                                 .min_w(px(120.))
                                 .bg(photo_block_bg(stable_hue(&photo.path.to_string_lossy())))
                                 .border_2()
-                                .when(is_selected, |b| b.border_color(col(GOLD)))
-                                .when(!is_selected, |b| b.border_color(transparent_black()))
-                                .child(photo_thumb(photo))
+                                .when(is_selected, |d| d.border_color(col(GOLD)))
+                                .when(!is_selected, |d| d.border_color(transparent_black()))
+                                .child(
+                                    div()
+                                        .id(("photothumb", idx))
+                                        .h(px(GRID_TILE_HEIGHT))
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .child(photo_thumb(photo)),
+                                )
                                 .child(
                                     div()
                                         .id(("photolabel", idx))
