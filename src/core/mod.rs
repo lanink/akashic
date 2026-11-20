@@ -5,6 +5,7 @@
 pub mod analyze;
 pub mod config;
 pub mod db;
+pub mod edit;
 pub mod model;
 pub mod ops;
 pub mod scanner;

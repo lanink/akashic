@@ -27,6 +27,12 @@ MVP v1 首个可交付版本：本地优先的照片整理工具，全部功能�
   Windows 便携版打包脚本 `scripts/package_portable.ps1` 与 `dist/` 产物；
   `design.md` 交付物状态刷新；`CHANGELOG.md`（本文件）与 readme 发布章节。
   实测（release / 5000 张）：扫描 77.13s（15.43 ms/张）、冷启动 28.83ms、筛选 0.034 ms/次；详见 `.docs/DEV_PLAN.md` M6。
+- **无边框窗口与自绘标题栏（2026-11-20）**：`WindowOptions.titlebar.appears_transparent = true` 隐藏系统标题栏；
+  标题栏红/黄/绿按钮分别调用 `Window::remove_window` / `minimize_window` / `zoom_window`，
+  并通过 `WindowControlArea` 接 Windows 系统命中测试；标题区可拖拽、双击最大化还原；macOS 保留原生红绿灯。
+- **原图编辑浮窗（2026-11-20）**：点击任意照片（相册库 / 整理结果 / 相似组 / 回收站）打开独立 `WindowKind::Floating` 窗口；
+  新增 `core::edit` 基于 imageflow 的编辑流水线（旋转/翻转/灰度·棕褐·反色/亮度·对比度·饱和度/等比缩放），
+  后台执行器生成预览，另存为原分辨率 PNG；浮窗内保留「查看图像信息」入口。
 
 ### 修复
 

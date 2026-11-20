@@ -18,6 +18,7 @@ use crate::core::ops::archive::{self as ops_archive, ArchiveMode, ArchivePlan, A
 use crate::core::ops::{rename as ops_rename, trash as ops_trash};
 use crate::core::model::{Photo, ScanProgress, ScanStats};
 use crate::ui::analyze::AnalyzeData;
+use crate::ui::editor::open_photo_editor;
 use crate::ui::library::LibraryData;
 use crate::ui::ops::OpsData;
 
@@ -805,46 +806,8 @@ impl Render for AppRoot {
         let search_input = self.search_input.clone();
         let prefix_input = self.prefix_input.clone();
 
-        let titlebar = div()
-            .id("titlebar")
-            .h(px(48.))
-            .bg(col(BG_SIDEBAR))
-            .flex().flex_row()
-            .items_center()
-            .px(px(20.))
-            .gap(px(16.))
-            .child(
-                div().flex().flex_row().gap(px(8.)).children(vec![
-                    dot(DANGER),
-                    dot(0xE5B84C),
-                    dot(0x5CB85C),
-                ]),
-            )
-            .child(
-                div()
-                    .id("app-title")
-                    .ml(px(8.))
-                    .flex_1()
-                    .text_color(gpui::white())
-                    .text_size(px(14.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Akashic · 相册整理师"),
-            )
-            .child(
-                div()
-                    .id("status-tag")
-                    .text_size(px(11.))
-                    .text_color(col(TEXT_LIGHT))
-                    .bg(rgba(255, 255, 255, 0.06))
-                    .px(px(14.))
-                    .py(px(3.))
-                    .rounded_full()
-                    .flex().flex_row()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(Icon::new(IconName::CircleCheck).size_3().text_color(col(GOLD)))
-                    .child("本地 · 离线"),
-            );
+        // 自绘标题栏（红=关闭 / 黄=最小化 / 绿=最大化还原），系统标题栏已在 main.rs 隐藏。
+        let titlebar = crate::ui::window_titlebar("Akashic · 相册整理师", "本地 · 离线");
 
         let sidebar = self.sidebar(state);
         // 全局错误横幅：索引/后台任务失败时，任意页面都能看到，而不是只在首页/设置页。
@@ -880,33 +843,21 @@ impl Render for AppRoot {
             .child(error_banner)
             .child(self.render_page(state, search_input, prefix_input));
 
+        // 窗口内容直接铺满客户区：此前外层 0xE8E4DE 底色 + 圆角卡片会形成一圈“额外边框”。
         div()
             .id("window")
-            .flex_1()
             .size_full()
-            .items_center()
-            .justify_center()
-            .bg(col(0xE8E4DE))
+            .flex().flex_col()
+            .bg(col(BG_WHITE))
+            .child(titlebar)
             .child(
                 div()
-                    .id("windowcard")
-                    // 跟随窗口尺寸（main.rs 只给初始尺寸与最小尺寸），不再硬编码 1200×780
-                    .size_full()
-                    .flex().flex_col()
-                    .overflow_hidden()
-                    .rounded_lg()
-                    .bg(col(BG_WHITE))
-                    .shadow_sm()
-                    .child(titlebar)
-                    .child(
-                        div()
-                            .id("mainlayout")
-                            .flex_1()
-                            .min_h_0()
-                            .flex().flex_row()
-                            .child(sidebar)
-                            .child(content),
-                    ),
+                    .id("mainlayout")
+                    .flex_1()
+                    .min_h_0()
+                    .flex().flex_row()
+                    .child(sidebar)
+                    .child(content),
             )
     }
 }
@@ -914,10 +865,6 @@ impl Render for AppRoot {
 /// 供组合根创建初始状态（main.rs 使用）。
 pub fn new_app_state(cx: &mut App, paths: Paths) -> Entity<AppState> {
     AppState::new(cx, paths)
-}
-
-fn dot(color: u32) -> impl IntoElement + 'static {
-    div().id(("dot", color)).size(px(13.)).rounded_full().bg(col(color))
 }
 
 // ===== 工具/卡片辅助 =====
@@ -1604,16 +1551,17 @@ impl AppRoot {
 
         match tool {
             OrganizeTool::Similar => self.render_similar_groups(state).into_any_element(),
-            OrganizeTool::Blurry => self.render_photo_list(&d.blurry, "模糊照片", "按模糊程度排序").into_any_element(),
-            OrganizeTool::Screenshot => self.render_photo_list(&d.screenshots, "截图", "按拍摄时间排序").into_any_element(),
-            OrganizeTool::Large => self.render_photo_list(&d.large, "大文件", "按文件大小排序").into_any_element(),
+            OrganizeTool::Blurry => self.render_photo_list(&d.blurry, "模糊照片", "按模糊程度排序", state.paths.clone()).into_any_element(),
+            OrganizeTool::Screenshot => self.render_photo_list(&d.screenshots, "截图", "按拍摄时间排序", state.paths.clone()).into_any_element(),
+            OrganizeTool::Large => self.render_photo_list(&d.large, "大文件", "按文件大小排序", state.paths.clone()).into_any_element(),
         }
     }
 
     /// 通用照片结果列表（模糊/截图/大文件）。
-    fn render_photo_list(&self, photos: &[Photo], title: &str, sub: &str) -> impl IntoElement + 'static {
+    fn render_photo_list(&self, photos: &[Photo], title: &str, sub: &str, paths: Paths) -> impl IntoElement + 'static {
         let tiles: Vec<_> = photos.iter().enumerate().map(|(i, p)| {
             let dialog_photo = p.clone();
+            let editor_paths = paths.clone();
             div()
                 .id(("resultitem", i))
                 .w(px(180.))
@@ -1622,7 +1570,10 @@ impl AppRoot {
                 .overflow_hidden()
                 .shadow_sm()
                 .cursor_pointer()
-                .on_click(move |_ev, window, cx| open_photo_dialog(dialog_photo.clone(), window, cx))
+                .on_click(move |_ev, window, cx| {
+                    open_photo_editor(dialog_photo.clone(), editor_paths.clone(), cx);
+                    let _ = window;
+                })
                 .child(
                     div()
                         .id(("resultthumb", i))
@@ -1665,11 +1616,13 @@ impl AppRoot {
     /// 相似组结果：每组一张代表卡片，显示成员数。
     fn render_similar_groups(&self, state: &AppState) -> impl IntoElement + 'static {
         let groups = &state.analyze_data.groups;
+        let editor_paths = state.paths.clone();
         let cards: Vec<_> = groups.iter().enumerate().map(|(gi, g)| {
             let rep = g.members.first();
             let name = rep.map(|p| p.file_name.clone()).unwrap_or_default();
             let hue = rep.map(|p| stable_hue(&p.path.to_string_lossy())).unwrap_or(0.0);
             let dialog_photo = rep.cloned();
+            let click_paths = editor_paths.clone();
             let thumb_el = rep
                 .map(photo_thumb)
                 .unwrap_or_else(|| photo_placeholder(hue, "", &name));
@@ -1683,8 +1636,9 @@ impl AppRoot {
                 .cursor_pointer()
                 .on_click(move |_ev, window, cx| {
                     if let Some(p) = dialog_photo.clone() {
-                        open_photo_dialog(p, window, cx);
+                        open_photo_editor(p, click_paths.clone(), cx);
                     }
+                    let _ = window;
                 })
                 .child(
                     div().id(("groupthumb", gi)).h(px(120.)).w_full().overflow_hidden()
@@ -1749,6 +1703,7 @@ impl AppRoot {
             .collect();
         let selected = state.selected.clone();
         let app_for_list = app.clone();
+        let editor_paths = state.paths.clone();
         let total_visible = photos.len();
 
         // 空态：未扫描时给出引导
@@ -1784,6 +1739,7 @@ impl AppRoot {
                     let location = photo.location.clone().unwrap_or_default();
                     let dialog_photo = photo.clone();
                     let tile_app = app_for_list.clone();
+                    let tile_paths = editor_paths.clone();
                     div()
                         .id(("photo", idx))
                         .w(px(GRID_TILE_WIDTH))
@@ -1794,7 +1750,7 @@ impl AppRoot {
                         .when(is_selected, |d| d.border_color(col(GOLD)))
                         .when(!is_selected, |d| d.border_color(transparent_black()))
                         .cursor_pointer()
-                        .on_click(move |ev, window, cx| {
+                        .on_click(move |ev, _window, cx| {
                             if ev.modifiers().control || ev.modifiers().platform {
                                 tile_app.update(cx, |s, cx| {
                                     if !s.selected.insert(photo_id) {
@@ -1803,7 +1759,7 @@ impl AppRoot {
                                     cx.notify();
                                 });
                             } else {
-                                open_photo_dialog(dialog_photo.clone(), window, cx);
+                                open_photo_editor(dialog_photo.clone(), tile_paths.clone(), cx);
                             }
                         })
                         .child(
@@ -2746,6 +2702,7 @@ impl AppRoot {
     fn page_trash(&self, state: &AppState) -> impl IntoElement + 'static {
         let app = &self.app;
         let ops = &state.ops_data;
+        let editor_paths = state.paths.clone();
 
         let rows = ops
             .trash
@@ -2753,6 +2710,7 @@ impl AppRoot {
             .enumerate()
             .map(|(i, item)| {
                 let app = app.clone();
+                let editor_paths = editor_paths.clone();
                 let id = item.id;
                 let name = item.photo.file_name.clone();
                 let size = item.photo.file_size_label();
@@ -2776,8 +2734,8 @@ impl AppRoot {
                             .overflow_hidden()
                             .cursor_pointer()
                             .child(photo_thumb(&thumb_photo))
-                            .on_click(move |_ev, window, cx| {
-                                open_photo_dialog(thumb_photo.clone(), window, cx)
+                            .on_click(move |_ev, _window, cx| {
+                                open_photo_editor(thumb_photo.clone(), editor_paths.clone(), cx)
                             }),
                     )
                     .child(div().w(px(300.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).child(name))
@@ -3221,7 +3179,7 @@ fn reveal_in_explorer(path: &std::path::Path) {
 
 /// 打开照片详情：应用内显示原图大图 + 完整图像信息。
 /// 接受一份 owned Photo，相册库 / 整理结果 / 回收站均可调用。
-fn open_photo_dialog(photo: Photo, window: &mut Window, cx: &mut App) {
+pub(crate) fn open_photo_dialog(photo: Photo, window: &mut Window, cx: &mut App) {
     let name = photo.file_name.clone();
     let path_str = photo.path.to_string_lossy().to_string();
     let parent_str = photo

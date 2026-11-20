@@ -1,8 +1,8 @@
 # 模块：core-model
 
-> 生成时间：2026-11-19 10:38 +0800
+> 生成时间：2026-11-20 17:03 +0800
 > 覆盖范围：src/core/config.rs, src/core/mod.rs, src/core/model.rs（按路径排序）
-> 覆盖 hash：f8ad5300fb64（取前 12 位，由生成者用命令行工具计算）
+> 覆盖 hash：77b92d19c168（取前 12 位，由生成者用命令行工具计算）
 > 可信度：AI 生成未审
 > 状态：valid
 
@@ -33,7 +33,7 @@
 
 ## 依赖关系
 - 依赖的外部模块：`dirs`（应用数据目录）、`std::fs`/`std::path`。
-- 被谁依赖：`core-scanner`（构造 Photo/ScanStats）、`core-analyze`（PhotoAnalysis/PhotoGroup/BLUR_THRESHOLD）、`core-ops`（TrashItem/OpLog/OpEntry/RenameContext 等）、`ui-desktop`（LibraryData/AnalyzeData/OpsData 消费）、`main.rs`（Paths）。
+- 被谁依赖：`core-scanner`（构造 Photo/ScanStats）、`core-analyze`（PhotoAnalysis/PhotoGroup/BLUR_THRESHOLD）、`core-ops`（TrashItem/OpLog/OpEntry/RenameContext 等）、`core-edit`（独立编辑模块，由 `src/core/mod.rs` 同级导出）、`ui-desktop`（LibraryData/AnalyzeData/OpsData 消费）、`main.rs`（Paths）。
 
 ## 常见改动点
 - 新增照片字段：在 `Photo` 加字段 → 同步 `db.rs` 的 schema、`PHOTO_COLUMNS`、`row_to_photo`、`upsert_photo` 与所有构造处（scanner/analyze 测试）。
@@ -50,6 +50,7 @@
 - 本模块不得引入 gpui 依赖。
 
 ## 变更记录
+- 2026-11-20 17:03：`src/core/mod.rs` 新增 `pub mod edit`，登记 `core-edit` 为同级 core 模块；刷新 hash。
 - 2026-11-19 10:38：新增共享常量 `BLUR_THRESHOLD`（消除 blur 与 db 两处阈值漂移）；刷新 hash。
 - 2026-11-18 17:40：M5 删除 M0 模拟数据（PhotoDef/PHOTOS/FolderNode/folder_defs/expandable_id），新增 `OpKind::label()` 与往返单测，刷新 hash。
 - 2026-11-18 16:58：M4 为 `OpKind` 新增 `ArchiveMove`/`ArchiveCopy`（`as_str` = `archive_move`/`archive_copy`），Photo 字段未变，刷新 hash。

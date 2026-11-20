@@ -29,12 +29,23 @@ fn main() {
         cx.spawn(async move |cx| {
             // 1200×780 仅作为首次打开时的初始尺寸，不再与 UI 布局强绑定；
             // 窗口可自由缩放，最小尺寸保证侧栏 + 内容区不挤压。
+            // 隐藏系统标题栏与默认边框，改用 AppRoot 自绘的标题栏（红黄绿按钮 + 拖拽区）。
+            // macOS 保留原生红绿灯位置；Windows/Linux 由自绘按钮调用窗口控制 API。
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: Point::new(px(80.), px(40.)),
                     size: Size::new(px(1200.), px(780.)),
                 })),
                 window_min_size: Some(Size::new(px(960.), px(640.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Akashic".into()),
+                    appears_transparent: true,
+                    traffic_light_position: if cfg!(target_os = "macos") {
+                        Some(point(px(14.), px(16.)))
+                    } else {
+                        None
+                    },
+                }),
                 ..WindowOptions::default()
             };
             let paths_for_window = paths.clone();
