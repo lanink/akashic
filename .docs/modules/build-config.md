@@ -1,8 +1,8 @@
 # 模块：build-config
 
-> 生成时间：2026-11-19 08:54 +0800
+> 生成时间：2026-11-20 16:35 +0800
 > 覆盖范围：.gitignore, .gitmodules, Cargo.lock, Cargo.toml, scripts/package_portable.ps1（按路径排序）
-> 覆盖 hash：44dcb0c47faf（取前 12 位，由生成者用命令行工具计算）
+> 覆盖 hash：2ad507641c53（取前 12 位，由生成者用命令行工具计算）
 > 可信度：AI 生成未审
 > 状态：valid
 

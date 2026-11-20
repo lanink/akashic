@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -36,13 +35,11 @@ const TEXT_LIGHT: u32 = 0x8A9AAA;
 const BORDER_LIGHT: u32 = 0xE8E4DE;
 const DANGER: u32 = 0xE0544C;
 
-// ===== M6 虚拟网格 =====
-/// 相册库每行固定列数；uniform_list 以「行」为 item，只渲染视口内的行。
-const GRID_COLUMNS: usize = 4;
+// ===== 相册库网格 =====
+/// 单张缩略图宽度（px）：与整理页 result tile 同款固定宽度，避免依赖父容器测量。
+const GRID_TILE_WIDTH: f32 = 180.;
 /// 单张缩略图高度（px）。
 const GRID_TILE_HEIGHT: f32 = 150.;
-/// 行高 = 缩略图高度 + 行间留白，所有行必须等高，uniform_list 才会按首行测量值排布。
-const GRID_ROW_HEIGHT: f32 = GRID_TILE_HEIGHT + 12.;
 
 /// hex -> Hsla
 fn col(hex: u32) -> Hsla {
@@ -873,7 +870,7 @@ impl Render for AppRoot {
             .flex_1()
             .min_h_0()
             // 关键：gpui 的 div() 默认是 Display::Block，子元素纵向堆叠且高度自适应。
-            // 不显式开 flex 的话，需要确定高度的页面（如相册库的 uniform_list）会拿不到高度。
+            // 不显式开 flex 的话，需要确定高度的页面拿不到高度。
             .flex()
             .flex_col()
             .bg(col(BG_WARM))
@@ -1741,8 +1738,9 @@ impl AppRoot {
             .shadow_sm()
             .child(render_folder_tree(state, app.clone()));
 
-        // M6 虚拟滚动：把可见照片按 GRID_COLUMNS 张一行交给 uniform_list，
-        // 只构造视口内的行，5000 张照片时不会一次性创建数千个 Button / img 元素。
+        // 相册库网格：与整理页 render_photo_list 完全相同的渲染路径（普通 div + flex_wrap + 固定宽 tile）。
+        // 曾尝试 uniform_list 虚拟滚动，但其 item 测量在此布局下把缩略图压成竖线且反复修不好；
+        // 正确性优先，回退到已验证可用的普通网格。5000 张量级的性能权衡留待后续单独处理。
         let photos: Vec<Photo> = state
             .data
             .visible_photos()
@@ -1752,7 +1750,6 @@ impl AppRoot {
         let selected = state.selected.clone();
         let app_for_list = app.clone();
         let total_visible = photos.len();
-        let row_count = total_visible.div_ceil(GRID_COLUMNS);
 
         // 空态：未扫描时给出引导
         let grid_body: AnyElement = if photos.is_empty() {
@@ -1778,92 +1775,74 @@ impl AppRoot {
                 )
                 .into_any_element()
         } else {
-            let list = uniform_list(
-                "photo-virtual-grid",
-                row_count,
-                move |range: Range<usize>, _window: &mut Window, _cx: &mut App| -> Vec<AnyElement> {
-                    let mut rows: Vec<AnyElement> = Vec::with_capacity(range.end - range.start);
-                    for row in range {
-                        let mut row_el = div()
-                            .id(("photo-row", row))
-                            .flex().flex_row()
-                            .w_full()
-                            .gap(px(12.))
-                            .h(px(GRID_ROW_HEIGHT))
-                            .pb(px(12.));
-                        for column in 0..GRID_COLUMNS {
-                            let idx = row * GRID_COLUMNS + column;
-                            let Some(photo) = photos.get(idx) else { break };
-                            let photo_id = photo.id;
-                            let is_selected = selected.contains(&photo_id);
-                            let location = photo.location.clone().unwrap_or_default();
-                            let dialog_photo = photo.clone();
-                            let tile_app = app_for_list.clone();
-                            // 与整理页 render_photo_list 一致用 div 做 tile：
-                            // gpui-component 的 Button 内部有独立 flex/padding 布局，
-                            // img().size_full() 直接塞进去会塌陷成竖线；div + 明确尺寸容器才稳定。
-                            let tile = div()
-                                .id(("photo", idx))
-                                .relative()
-                                .overflow_hidden()
-                                .h(px(GRID_TILE_HEIGHT))
-                                .flex_1()
-                                .min_w(px(120.))
-                                .bg(photo_block_bg(stable_hue(&photo.path.to_string_lossy())))
-                                .border_2()
-                                .when(is_selected, |d| d.border_color(col(GOLD)))
-                                .when(!is_selected, |d| d.border_color(transparent_black()))
-                                .child(
-                                    div()
-                                        .id(("photothumb", idx))
-                                        .h(px(GRID_TILE_HEIGHT))
-                                        .w_full()
-                                        .overflow_hidden()
-                                        .child(photo_thumb(photo)),
-                                )
-                                .child(
-                                    div()
-                                        .id(("photolabel", idx))
-                                        .absolute()
-                                        .bottom_0()
-                                        .left_0()
-                                        .right_0()
-                                        .px(px(8.))
-                                        .py(px(2.))
-                                        .bg(rgba(26, 38, 52, 0.7))
-                                        .text_color(gpui::white())
-                                        .text_size(px(10.))
-                                        .child(location),
-                                )
-                                .on_click(move |ev, window, cx| {
-                                    if ev.modifiers().control || ev.modifiers().platform {
-                                        tile_app.update(cx, |s, cx| {
-                                            if !s.selected.insert(photo_id) {
-                                                s.selected.remove(&photo_id);
-                                            }
-                                            cx.notify();
-                                        });
-                                    } else {
-                                        open_photo_dialog(dialog_photo.clone(), window, cx);
+            let tiles: Vec<AnyElement> = photos
+                .iter()
+                .enumerate()
+                .map(|(idx, photo)| {
+                    let photo_id = photo.id;
+                    let is_selected = selected.contains(&photo_id);
+                    let location = photo.location.clone().unwrap_or_default();
+                    let dialog_photo = photo.clone();
+                    let tile_app = app_for_list.clone();
+                    div()
+                        .id(("photo", idx))
+                        .w(px(GRID_TILE_WIDTH))
+                        .relative()
+                        .overflow_hidden()
+                        .bg(photo_block_bg(stable_hue(&photo.path.to_string_lossy())))
+                        .border_2()
+                        .when(is_selected, |d| d.border_color(col(GOLD)))
+                        .when(!is_selected, |d| d.border_color(transparent_black()))
+                        .cursor_pointer()
+                        .on_click(move |ev, window, cx| {
+                            if ev.modifiers().control || ev.modifiers().platform {
+                                tile_app.update(cx, |s, cx| {
+                                    if !s.selected.insert(photo_id) {
+                                        s.selected.remove(&photo_id);
                                     }
+                                    cx.notify();
                                 });
-                            row_el = row_el.child(tile);
-                        }
-                        rows.push(row_el.into_any_element());
-                    }
-                    rows
-                },
-            );
+                            } else {
+                                open_photo_dialog(dialog_photo.clone(), window, cx);
+                            }
+                        })
+                        .child(
+                            div()
+                                .id(("photothumb", idx))
+                                .h(px(GRID_TILE_HEIGHT))
+                                .w_full()
+                                .overflow_hidden()
+                                .child(photo_thumb(photo)),
+                        )
+                        .child(
+                            div()
+                                .id(("photolabel", idx))
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .right_0()
+                                .px(px(8.))
+                                .py(px(2.))
+                                .bg(rgba(26, 38, 52, 0.7))
+                                .text_color(gpui::white())
+                                .text_size(px(10.))
+                                .child(location),
+                        )
+                        .into_any_element()
+                })
+                .collect();
             div()
                 .id("photo-grid-scroll")
                 .flex_1()
                 .min_h_0()
-                // 必须是 flex 容器：uniform_list 作为 flex item 由 cross-axis stretch 直接拿到宽度。
-                // 若这里是默认 Block，列表的百分比宽度会回退成首行 min-content，
-                // 4 个 flex_1 的 tile 被压成几条竖线（只剩 gap 可见）。
-                .flex()
-                .flex_col()
-                .child(list.flex_1().min_h_0())
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .id("photo-grid")
+                        .flex().flex_row().flex_wrap()
+                        .gap(px(12.))
+                        .children(tiles),
+                )
                 .into_any_element()
         };
 
