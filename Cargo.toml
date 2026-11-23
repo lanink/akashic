@@ -42,3 +42,28 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# 开发模式也把 imageflow 及其 C 编解码器按优化级别编译：
+# `cargo run` 默认走 dev，若 imageflow 保持 opt-level=0，4000x3000 预览要 3 秒以上，
+# 优化后与 release 接近，避免“功能可用但交互卡住”的体验。
+[profile.dev.package.imageflow_c_components]
+opt-level = 3
+
+[profile.dev.package.imageflow_core]
+opt-level = 3
+
+[profile.dev.package.imageflow_helpers]
+opt-level = 3
+
+[profile.dev.package.imageflow_riapi]
+opt-level = 3
+
+[profile.dev.package.imageflow_types]
+opt-level = 3
+
+# JPEG 解码/编码由 mozjpeg 完成，同样不能在 dev 下跑未优化版本。
+[profile.dev.package.mozjpeg]
+opt-level = 3
+
+[profile.dev.package.mozjpeg-sys]
+opt-level = 3

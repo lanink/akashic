@@ -19,9 +19,10 @@
 > 更新日期：2026-11-20 16:30 +0800（修复相册库缩略图不显示：根因是 tile 用 `Button`，其内部布局让 `img().size_full()` 塌陷；改为与整理页一致的普通 `div` + 明确尺寸缩略图容器；刷新 ui-desktop hash）。
 > 更新日期：2026-11-20 16:35 +0800（相册库彻底回退虚拟滚动：多次修复后缩略图仍异常，改用与整理页完全相同的普通 `flex_wrap` 网格 + 固定宽 tile；移除 uniform_list；刷新 ui-desktop hash，顺带校准 build-config hash）。
 > 更新日期：2026-11-20 17:03 +0800（无边框窗口 + 自绘红黄绿按钮；新增 core-edit imageflow 编辑内核与 ui/editor 原图浮窗，照片点击改开浮窗；新增 core-edit 模块 md，刷新 ui-desktop/core-model/product-spec hash 与状态总览）。
+> 更新日期：2026-11-23 12:05 +0800（图片编辑性能优化：一次性 1600px JPEG 底图缓存 + 40ms 合并 + 单飞行预览 + 默认参数零计算；dev 模式 imageflow/mozjpeg 包级 opt-level=3；刷新 core-edit / ui-desktop / build-config / product-spec hash，并校准历史 ai-workflow hash，状态总览全量一致）。
 
 ## 项目概述
-Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引（目录选择/后台扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索）。M2 已实现分析与智能整理：模糊评分、截图启发式、大文件排序、相似归组（pHash + dssim + 代表元聚类），扫描后自动后台分析，整理页 4 个工具卡片接入真实结果列表。M3 已实现批量操作与回收站：批量删除（移动到回收站，绝不永久丢失）、批量重命名（预设模板+预览+冲突处理+一次撤销）、回收站恢复/清空/可配置保留期清理，操作日志贯穿。所有照片展示位（相册库网格/整理结果/相似组/回收站）已接入 gpui `img(PathBuf)` 真实缩略图，点击照片弹出原图大图 + 完整图像信息（基本信息/分析结果/索引字段）。M4 已实现智能归档：按年/年月/故事/标签 4 种规则生成完整目录树预览，支持移动与复制两种模式，执行后可一次撤销；整理页「智能重命名/智能归档」卡片与侧栏「智能整理」徽标均已接真实数据。M5 完成体验闭环：首页统计/整理进度/最近操作全部接真实数据并补加载·空·错误态，新增设置与隐私中心（本机路径、可配置回收站保留期、数据概况、隐私说明、关于），窗口去掉 1200×780 强绑定并设最小尺寸，图标注册补齐 47/47，清理 M0 模拟数据，readme.md 重写为可独立上手的文档。M6 完成打磨与交付：相册库改为 gpui `uniform_list` 虚拟滚动（每行 4 张、等高，只渲染视口内行），新增 5000 张照片性能基准与 `[profile.release]` 优化配置，提供 Windows 便携版打包脚本与 zip 产物，刷新 `design.md` 交付物状态与实现差异、新增 `CHANGELOG.md`、readme 补发布章节，并全量复核模块 hash。2026-11-19 完成一轮全量 bug 审查与修复（数据安全、索引正确性、分析准确性、批量重命名、智能归档、缩略图缓存与 UI 交互），新增 22 个回归测试，`cargo test` 63 个常规测试全绿。地图足迹仍属本期暂缓。
+Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私优先的批量照片整理工具，PRD 规划智能扫描、相似归组、模糊检测、截图/大文件筛选、批量删除与回收站、智能重命名、智能归档等能力。M1 已接入真实本地索引（目录选择/后台扫描/EXIF/内容哈希/SQLite/缩略图/目录过滤/搜索）。M2 已实现分析与智能整理：模糊评分、截图启发式、大文件排序、相似归组（pHash + dssim + 代表元聚类），扫描后自动后台分析，整理页 4 个工具卡片接入真实结果列表。M3 已实现批量操作与回收站：批量删除（移动到回收站，绝不永久丢失）、批量重命名（预设模板+预览+冲突处理+一次撤销）、回收站恢复/清空/可配置保留期清理，操作日志贯穿。所有照片展示位（相册库网格/整理结果/相似组/回收站）已接入 gpui `img(PathBuf)` 真实缩略图，点击照片弹出原图大图 + 完整图像信息（基本信息/分析结果/索引字段）。M4 已实现智能归档：按年/年月/故事/标签 4 种规则生成完整目录树预览，支持移动与复制两种模式，执行后可一次撤销；整理页「智能重命名/智能归档」卡片与侧栏「智能整理」徽标均已接真实数据。M5 完成体验闭环：首页统计/整理进度/最近操作全部接真实数据并补加载·空·错误态，新增设置与隐私中心（本机路径、可配置回收站保留期、数据概况、隐私说明、关于），窗口去掉 1200×780 强绑定并设最小尺寸，图标注册补齐 47/47，清理 M0 模拟数据，readme.md 重写为可独立上手的文档。M6 完成打磨与交付：相册库改为 gpui `uniform_list` 虚拟滚动（每行 4 张、等高，只渲染视口内行），新增 5000 张照片性能基准与 `[profile.release]` 优化配置，提供 Windows 便携版打包脚本与 zip 产物，刷新 `design.md` 交付物状态与实现差异、新增 `CHANGELOG.md`、readme 补发布章节，并全量复核模块 hash。2026-11-19 完成一轮全量 bug 审查与修复（数据安全、索引正确性、分析准确性、批量重命名、智能归档、缩略图缓存与 UI 交互），新增 22 个回归测试，`cargo test` 63 个常规测试全绿。地图足迹仍属本期暂缓。2026-11-23 完成图片编辑性能专项：预览改 JPEG 输出 + JPEG IDCT 降采样、一次性 1600px 底图缓存、40ms 连续点击合并、单飞行后台预览、重置零计算快路径，并在 dev 模式对 imageflow/mozjpeg 做包级 `opt-level = 3`；release 实测首张 1600px 预览 172ms、后续编辑 59ms，70 个常规测试全绿。
 
 ## 目录职责表
 
@@ -30,12 +31,12 @@ Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私�
 | `src/main.rs` | 组合根：Application/Assets/GPUI 初始化、本地目录初始化、窗口初始尺寸与 `window_min_size`、启动失败显式报错 | [ui-desktop](modules/ui-desktop.md) |
 | `src/lib.rs` | 库入口：`pub mod core; pub mod ui;` | [build-config](modules/build-config.md) |
 | `src/core/model.rs` / `config.rs` / `mod.rs` | 真实数据模型（Photo/Folder/ScanStats）、共享 `BLUR_THRESHOLD`、本地路径配置与 core 模块登记 | [core-model](modules/core-model.md) |
-| `src/core/edit.rs` | imageflow 编辑流水线：旋转/翻转/滤镜/亮度对比度饱和度/等比缩放，输出 PNG（可单测） | [core-edit](modules/core-edit.md) |
+| `src/core/edit.rs` | imageflow 编辑流水线：旋转/翻转/滤镜/亮度对比度饱和度/等比缩放；另存为 PNG、预览 JPEG + IDCT 降采样（可单测） | [core-edit](modules/core-edit.md) |
 | `src/core/db.rs` / `scanner.rs` / `thumbnail.rs` | SQLite 索引、递归扫描+EXIF+哈希、缩略图缓存、分析结果/操作日志/settings 读写 | [core-scanner](modules/core-scanner.md) |
 | `src/core/analyze/*.rs` | 模糊评分、截图识别、大文件排序、相似归组（pHash+dssim+代表元聚类） | [core-analyze](modules/core-analyze.md) |
 | `src/core/ops/*.rs` | 回收站（删除/恢复/清空/保留期清理/撤销）、批量重命名模板引擎、M4 智能归档（4 规则 / 移动·复制 / 目录树预览 / 执行 / 撤销）、操作日志 | [core-ops](modules/core-ops.md) |
 | `src/ui/app.rs` / `assets.rs` | gpui 渲染：全局状态、页面分发（7 页含智能归档/设置与隐私）、目录树、普通 flex_wrap 缩略图网格、照片图片渲染（缩略图/原图大图）、详情弹窗、整理页结果列表、重命名页、归档页、回收站页、首页真实统计与状态态、图标资源（47 个 SVG 全登记） | [ui-desktop](modules/ui-desktop.md) |
-| `src/ui/editor.rs` | 原图编辑浮窗：`WindowKind::Floating` 独立窗口、原图展示、imageflow 编辑控件、后台预览与另存为 PNG | [ui-desktop](modules/ui-desktop.md) |
+| `src/ui/editor.rs` | 原图编辑浮窗：`WindowKind::Floating` 独立窗口、1600px JPEG 底图缓存、40ms 合并 + 单飞行预览、默认参数零计算快路径、另存为原分辨率 PNG | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/mod.rs` | 自绘窗口标题栏：红黄绿按钮（关闭/最小化/最大化还原）、拖拽区、双击最大化 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/library.rs` | UI 数据适配层：索引数据 → 相册库视图模型 | [ui-desktop](modules/ui-desktop.md) |
 | `src/ui/analyze.rs` | UI 分析适配层：分析结果 → 整理页视图模型 | [ui-desktop](modules/ui-desktop.md) |
@@ -55,7 +56,7 @@ Akashic（阿卡西）是“相册整理师”桌面应用：定位本地隐私�
 | `akashic-ds.html` | 单文件 HTML 交互设计稿，5 个页面 + 照片详情弹窗 | [design-prototype](modules/design-prototype.md) |
 | `design.md` | v1 PRD（定位、MVP 功能、信息架构、视觉基调）；M6 刷新头部状态、第 5 节交付物真实状态并新增第 8 节实现差异 | [product-spec](modules/product-spec.md) |
 | `readme.md` | M5 重写、M6 扩为 8 节：环境、submodule、构建/运行/测试、首次使用、数据目录、文档导航、发布与便携包、已知限制 | [product-spec](modules/product-spec.md) |
-| `Cargo.toml` / `Cargo.lock` | 包定义、依赖与版本锁定、M6 `[profile.release]` | [build-config](modules/build-config.md) |
+| `Cargo.toml` / `Cargo.lock` | 包定义、依赖与版本锁定、M6 `[profile.release]`、dev 模式 imageflow/mozjpeg 包级优化覆盖 | [build-config](modules/build-config.md) |
 | `assets/icons/*.svg` | 47 个 Lucide 线性图标，编译期嵌入 | [icon-assets](modules/icon-assets.md) |
 | `.docs/WORKFLOW.md` | AI 工作协议（Agent 不得修改） | [ai-workflow](modules/ai-workflow.md) |
 | `.docs/DEV_PLAN.md` | 开发计划（规划文档，非派生缓存，不参与覆盖 hash） | 无 |
@@ -119,29 +120,29 @@ ai-workflow ──> 约束所有 Agent 对以上模块的读取与文档更新
 - 首页入口：`Page::Home` → `page_home`：统计卡来自 `LibraryData`，整理进度来自 `AnalyzeData`/`analyze_status`，最近整理记录来自 `OpsData.recent_ops`（`OpKind::label()`）；错误态由全局横幅统一展示，首页 banner 只保留进度态。
 - 设置与隐私入口：侧栏「设置」→ `Page::Settings` → `page_settings`：本机 `Paths` 路径、保留期按钮 `ops_trash::set_retention_days`、真实数据概况、隐私说明、关于；回收站页「清理 N 天前」跟随 `retention_days`。
 - 窗口尺寸与装饰：`src/main.rs` 的 `WindowOptions.window_min_size = 960×640`、`titlebar.appears_transparent = true`（隐藏系统标题栏）；`src/ui/mod.rs::window_titlebar` 自绘红黄绿按钮（关闭/最小化/最大化还原）+ 拖拽区 + 双击最大化；`AppRoot::render` 客户区 `.size_full()` 铺满，无额外米色边框。
-- 图片编辑入口：`src/ui/editor.rs` 的控件改 `EditOptions` → `schedule_preview()` 后台调 `src/core/edit.rs::apply(src, dst, options)`（imageflow 图：Decode → Rotate/Flip/ColorFilter/Constrain → Encode PNG）→ 代次一致才提交预览；另存为用 `max_dimension: 0` 保留原分辨率，`rfd::FileDialog::save_file()` 选目标路径。
+- 图片编辑入口：`src/ui/editor.rs` 打开浮窗先用缩略图占位，后台 `apply_preview` 生成 1600px JPEG 底图并缓存（新于原图则复用）；控件改 `EditOptions` → `schedule_preview()` 在 40ms 合并后以单飞行任务后台调 `src/core/edit.rs::apply_preview(base, dst, options)`（imageflow 图：Decode → Rotate/Flip/ColorFilter/Constrain → Encode JPEG），默认参数直接复用底图，代次一致才提交预览；另存为用 `max_dimension: 0` 调 `apply` 输出原分辨率 PNG，`rfd::FileDialog::save_file()` 选目标路径。
 - 分析算法：`src/core/analyze/`（blur / classify / similarity / pipeline）；测试 `tests/analyze_test.rs`。
 - 批量操作：`src/core/ops/`（trash / rename / archive / mod）；测试 `tests/ops_test.rs` / `tests/archive_test.rs`。
 - 设计稿入口：`akashic-ds.html` 的 `#page-library`（默认 active）与 `switchPage(pageId)`。
 - 相册库网格入口：`src/ui/app.rs::page_library` → 普通 `div().flex().flex_row().flex_wrap()` 网格，tile 固定 `GRID_TILE_WIDTH=180` / `GRID_TILE_HEIGHT=150`，外层 `overflow_y_scroll`；虚拟滚动已回退（曾把缩略图压成竖线，正确性优先）。
 - 性能基准入口：`cargo test --release --test perf_test -- --ignored --nocapture`（`tests/perf_test.rs`，5000 张合成图）。
 - 便携包入口：`scripts/package_portable.ps1` → `dist/akashic-0.1.0-win-x86_64.zip`（`cargo build --release` + 文档 + 许可说明）。
-- 构建验证：`cargo check` / `cargo test` / `cargo build`（2026-11-19 复核：63 个常规测试全绿 + 1 个 `#[ignore]` 基准，debug 构建通过；M6 release 便携包为本轮之前产物，未重新打包）。
+- 构建验证：`cargo check` / `cargo test` / `cargo build`（2026-11-23 复核：70 个常规测试全绿 + 2 个 `#[ignore]` 基准，debug 构建通过）；编辑性能基准：release 首张 1600px 预览 172ms / 后续编辑 59ms，dev 加包级优化后后续编辑约 103ms；M6 release 便携包为本轮之前产物，未重新打包。
 
 ## 文档状态总览
 
 | 模块 | 覆盖 hash | 状态 | 可信度 |
 | --- | --- | --- | --- |
-| ui-desktop | 25e29084480f | valid | AI 生成未审 |
+| ui-desktop | b33a1eaa5888 | valid | AI 生成未审 |
 | core-model | 77b92d19c168 | valid | AI 生成未审 |
-| core-edit | 04ddd36ec5af | valid | AI 生成未审 |
+| core-edit | 9ab5108e3a22 | valid | AI 生成未审 |
 | core-scanner | 0e97b65fe29f | valid | AI 生成未审 |
 | core-analyze | a9809cab5871 | valid | AI 生成未审 |
 | core-ops | f76508cc0b9d | valid | AI 生成未审 |
 | design-prototype | d32b2f6af661 | valid | AI 生成未审 |
-| product-spec | 634b6237b18e | valid | AI 生成未审 |
-| build-config | 2ad507641c53 | valid | AI 生成未审 |
+| product-spec | c5fbbf68c832 | valid | AI 生成未审 |
+| build-config | 67e8503e611b | valid | AI 生成未审 |
 | icon-assets | 4f60f3a7bd02 | valid | AI 生成未审 |
-| ai-workflow | 3dfb897e056b | valid | AI 生成未审 |
+| ai-workflow | b5432c7e4d34 | valid | AI 生成未审 |
 
 > 初始化提示：以上目录职责与依赖图由 AI 生成，需人类审阅确认；后续结构性变更须同步更新本文件。

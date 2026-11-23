@@ -392,6 +392,26 @@ mod tests {
     }
 
     #[test]
+    fn identity_flags_distinguish_preview_size_from_real_edits() {
+        let base = EditOptions::default();
+        let preview_only = EditOptions {
+            max_dimension: 1600,
+            ..Default::default()
+        };
+        let rotated = EditOptions {
+            rotate_degrees: 90,
+            ..Default::default()
+        };
+        assert!(base.is_identity());
+        assert!(!base.has_user_edits());
+        // 仅改预览尺寸不算用户编辑，但也不再是“完全默认”，避免误命中原图快路径。
+        assert!(!preview_only.is_identity());
+        assert!(!preview_only.has_user_edits());
+        assert!(!rotated.is_identity());
+        assert!(rotated.has_user_edits());
+    }
+
+    #[test]
     fn missing_source_is_rejected() {
         let dir = TempDir::new("missing");
         let err = apply(

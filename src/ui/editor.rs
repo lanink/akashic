@@ -2,8 +2,8 @@
 //!
 //! 编辑能力：旋转 / 翻转 / 灰度·棕褐·反色 / 亮度·对比度·饱和度 / 等比缩放。
 //! 性能策略：打开时只从原图生成一次 1600px JPEG 底图，后续交互都在底图上处理；
-//! 连续点击做 80ms 合并 + 单飞行任务，避免重复全分辨率解码/PNG 编码；
-//! 「另存为」才按原分辨率输出 PNG。
+//! 连续点击做 40ms 合并 + 单飞行任务，避免重复全分辨率解码/PNG 编码；
+//! 恢复默认参数时直接复用底图，不再跑一遍 imageflow；「另存为」才按原分辨率输出 PNG。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,7 +30,7 @@ const DANGER: u32 = 0xE0544C;
 /// 交互预览的最长边。底图与编辑预览都用这个尺寸，足够 1100×760 浮窗显示。
 const PREVIEW_MAX_DIMENSION: u32 = 1600;
 /// 连续点击合并窗口：只重跑最后一次参数，避免每个 +/- 点击都触发一次全流水线。
-const PREVIEW_DEBOUNCE_MS: u64 = 80;
+const PREVIEW_DEBOUNCE_MS: u64 = 40;
 
 fn col(hex: u32) -> gpui::Hsla {
     gpui::Hsla::from(gpui::rgb(hex))
@@ -234,6 +234,15 @@ impl PhotoEditor {
         }
         let src = self.base.clone().unwrap_or_else(|| self.source.clone());
         let options = self.options;
+        // 恢复默认参数时，1600px 底图本身就是结果，直接展示，省掉一次解码+编码。
+        if options.is_identity() && self.base.is_some() {
+            self.preview = src;
+            self.status = "快速预览已就绪（最长边 1600px）".to_string();
+            self.error = None;
+            self.busy = self.save_running;
+            cx.notify();
+            return;
+        }
         let dest = preview_path(&self.preview_dir(), &src, &options, OutputFormat::Jpeg);
         self.preview_running = true;
 
